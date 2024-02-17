@@ -27,7 +27,7 @@ from ymir.data import Fragment
 from ymir.params import EMBED_HYDROGENS
 from ymir.metrics.activity import VinaScore, VinaScorer
 
-logging.basicConfig(filename='train_tfsn_d.log', 
+logging.basicConfig(filename='train_tfsn_d_sum.log', 
                     encoding='utf-8', 
                     level=logging.INFO,
                     format='%(asctime)s %(levelname)s:%(message)s', 
@@ -58,10 +58,10 @@ max_grad_value = 0.5
 hidden_irreps = o3.Irreps('16x0e + 8x1o + 4x2e + 2x3o')
 torsion_values = range(-180, 180, 10)
 
-n_complexes = 500
+n_complexes = 10
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
-experiment_name = f"ymir_tfsn_d_{timestamp}"
+experiment_name = f"ymir_tfsn_d_sum_{timestamp}"
 
 writer = SummaryWriter(f"logs/{experiment_name}")
 
@@ -210,9 +210,10 @@ assert action_dim == envs[0].action_dim
 batch_env = BatchEnv(envs)
 
 agent = Agent(protected_fragments=final_fragments, 
-              hidden_irreps=hidden_irreps)
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_tfsn_d_15_02_2024_15_11_12_4500.pt')
-agent.load_state_dict(state_dict)
+              hidden_irreps=hidden_irreps,
+              summing_embeddings=True)
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_tfsn_d_15_02_2024_15_11_12_4500.pt')
+# agent.load_state_dict(state_dict)
 
 fragment_features = agent.extract_fragment_features()
 

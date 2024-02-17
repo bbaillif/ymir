@@ -1,13 +1,9 @@
 from rdkit.Chem import BRICS
 from scipy.spatial import distance_matrix
-from ymir.utils.fragment import (get_neighbor_id_for_atom_id, 
-                                   get_max_num_neighbor_from_original)
 from collections import defaultdict
-from rdkit.Chem.rdMolTransforms import SetDihedralDeg
 from ymir.data import Fragment
-from rdkit.Chem.rdMolAlign import AlignMol
 
-potential_reaction_t = (int, str)
+potential_reaction_t = tuple[int, str]
 potential_reactions: dict[int, dict[int, potential_reaction_t]] = defaultdict(dict)
 reaction_defs = BRICS.reactionDefs
 rxn_i = 0
@@ -110,30 +106,13 @@ reactions = BRICS.reverseReactions
                     
                     
 def add_fragment_to_seed(seed: Fragment,
-                         fragment: Fragment,
-                         torsion_value: float):
-    
-    assert torsion_value >= -180 and torsion_value <= 180, 'Torsion is in [-180, 180]'
+                         fragment: Fragment):
     
     seed_attach_points = seed.get_attach_points()
     assert len(seed_attach_points) == 1, 'There must be only one attach point on seed'
     
     fragment_attach_points = fragment.get_attach_points()
     assert len(fragment_attach_points) == 1, 'There must be only one attach point on fragment'
-    
-    seed_attach_atom_ids = list(seed_attach_points.keys())
-    fragment_attach_atom_ids = list(fragment_attach_points.keys())
-    
-    # Align the attachment-point/neighbor axis between the seed and the added fragment
-    atom_id1 = seed_attach_atom_ids[0]
-    neighbor_id1 = get_neighbor_id_for_atom_id(mol=seed, atom_id=atom_id1)
-    
-    atom_id2 = fragment_attach_atom_ids[0]
-    neighbor_id2 = get_neighbor_id_for_atom_id(mol=fragment, atom_id=atom_id2)
-    
-    rmsd = AlignMol(fragment, 
-                    seed, 
-                    atomMap=[(atom_id2, neighbor_id1), (neighbor_id2, atom_id1)])
     
     seed_attach_label: int = list(seed_attach_points.values())[0]
     fragment_attach_label: int = list(fragment_attach_points.values())[0]
@@ -165,10 +144,6 @@ def add_fragment_to_seed(seed: Fragment,
     product = products[0]
     
     product_positions = product.GetConformer().GetPositions()
-
-    # real_seed_ids = [atom.GetIdx() 
-    #                     for atom in seed.GetAtoms()
-    #                 if atom.GetAtomicNum() != 0]
     seed_positions = seed.GetConformer().GetPositions()
     
     dists = distance_matrix(seed_positions, product_positions)
@@ -182,46 +157,6 @@ def add_fragment_to_seed(seed: Fragment,
     closest_product_id_in_frag = dists.argmin(axis=1)
     fragment_to_product_mapping = {frag_id: int(product_id) 
                                     for frag_id, product_id in enumerate(closest_product_id_in_frag)}
-
-    # Get anchor and attach from seed
-    for atom in seed.GetAtoms():
-        if atom.GetAtomicNum() == 0:
-            seed_attach_atom_id = atom.GetIdx()
-            break
-    prod_seed_attach_atom_id = seed_to_product_mapping[seed_attach_atom_id]
-    seed_anchor_atom_id = get_neighbor_id_for_atom_id(seed, seed_attach_atom_id)
-    # prod_seed_anchor_atom_id = seed_to_product_mapping[seed_anchor_atom_id]
-
-    # Get anchor and attach from fragment
-    for atom in fragment.GetAtoms():
-        if atom.GetAtomicNum() == 0:
-            fragment_attach_atom_id = atom.GetIdx()
-            break
-    prod_fragment_attach_atom_id = fragment_to_product_mapping[fragment_attach_atom_id]
-    fragment_anchor_atom_id = get_neighbor_id_for_atom_id(fragment, fragment_attach_atom_id)
-    # prod_fragment_anchor_atom_id = fragment_to_product_mapping[fragment_anchor_atom_id]
-    
-    # Seed anchor = fragment attach, and fragment anchor = seed attach
-    
-    max_num_seed_neigh = get_max_num_neighbor_from_original(atom_id=prod_fragment_attach_atom_id, 
-                                                            mol=product, 
-                                                            original_atom_id=seed_anchor_atom_id) 
-    max_num_fragment_neigh = get_max_num_neighbor_from_original(atom_id=prod_seed_attach_atom_id, 
-                                                                mol=product, 
-                                                                original_atom_id=fragment_anchor_atom_id)
-    
-    # Only set torsion if there is a torsion (not counting H ?)
-    if max_num_seed_neigh is not None and max_num_fragment_neigh is not None:
-        begin_atom_idx = max_num_seed_neigh
-        second_atom_idx = prod_fragment_attach_atom_id
-        third_atom_idx = prod_seed_attach_atom_id
-        end_atom_idx = max_num_fragment_neigh
-        SetDihedralDeg(product.GetConformer(), 
-                        begin_atom_idx,
-                        second_atom_idx,
-                        third_atom_idx,
-                        end_atom_idx,
-                        torsion_value)
         
     seed_protections = seed.protections
     fragment_protections = fragment.protections

@@ -6,7 +6,7 @@ import time
 from gymnasium.spaces import Box, GraphInstance, Sequence
 from rdkit import Chem
 from rdkit.Chem import Mol
-from ymir.molecule_builder import add_fragment_to_seed
+from ymir.old.molecule_builder import add_fragment_to_seed
 from ymir.utils.fragment3d import (get_fragments_from_mol, 
                              get_attach_points, 
                              protect_fragment, 

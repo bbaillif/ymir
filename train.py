@@ -17,17 +17,17 @@ from scipy.spatial.distance import euclidean
 from ymir.fragment_library import FragmentLibrary
 from ymir.data.structure import Complex
 from ymir.utils.fragment import get_fragments_from_mol
-from ymir.old.molecule_builder import potential_reactions
+from ymir.molecule_builder import potential_reactions
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.utils.spatial import rotate_conformer, translate_conformer
-from ymir.tfsn_discrete_env import (FragmentBuilderEnv, 
+from ymir.env import (FragmentBuilderEnv, 
                             BatchEnv)
-from ymir.tfsn_discrete_policy import Agent
+from ymir.policy import Agent
 from ymir.data import Fragment
-from ymir.params import EMBED_HYDROGENS
+from ymir.params import EMBED_HYDROGENS, HIDDEN_IRREPS, TORSION_ANGLES_DEG
 from ymir.metrics.activity import VinaScore, VinaScorer
 
-logging.basicConfig(filename='train_tfsn_d.log', 
+logging.basicConfig(filename='train.log', 
                     encoding='utf-8', 
                     level=logging.INFO,
                     format='%(asctime)s %(levelname)s:%(message)s', 
@@ -55,17 +55,16 @@ clip_coef = 0.5
 ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
-hidden_irreps = o3.Irreps('16x0e + 8x1o + 4x2e + 2x3o')
-torsion_values = range(-180, 180, 10)
 
 n_complexes = 500
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
-experiment_name = f"ymir_tfsn_d_{timestamp}"
+experiment_name = f"ymir_v1_{timestamp}"
 
 writer = SummaryWriter(f"logs/{experiment_name}")
 
-fragment_library = FragmentLibrary()
+removeHs = not EMBED_HYDROGENS
+fragment_library = FragmentLibrary(removeHs=removeHs)
 ligands = fragment_library.ligands
 protected_fragments = fragment_library.protected_fragments
 
@@ -165,23 +164,10 @@ for fragment in protected_fragments:
     translate_conformer(conformer=fragment.GetConformer(),
                         translation=translation)
 
-final_fragments = []
-for protected_fragment in protected_fragments:
-    
-    for torsion_value in torsion_values :
-    
-        new_fragment = Fragment(protected_fragment,
-                                protections=protected_fragment.protections)
-
-        rotation = Rotation.from_euler('x', torsion_value)
-        rotate_conformer(new_fragment.GetConformer(), rotation=rotation)
-        
-        final_fragments.append(new_fragment)
-
-action_dim = len(final_fragments)
+action_dim = len(protected_fragments)
 
 fragment_attach_labels = []
-for act_i, fragment in enumerate(final_fragments):
+for act_i, fragment in enumerate(protected_fragments):
     for atom in fragment.GetAtoms():
         if atom.GetAtomicNum() == 0:
             attach_label = atom.GetIsotope()
@@ -198,20 +184,21 @@ for attach_label_1, d_potential_attach in potential_reactions.items():
              
     valid_action_masks[attach_label_1] = torch.tensor(mask, dtype=torch.bool)
 
-logging.info(f'There are {len(final_fragments)} fragments')
+logging.info(f'There are {len(protected_fragments)} fragments')
 
-envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_fragments,
+envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=protected_fragments,
                                                      z_table=z_table,
                                                     max_episode_steps=n_steps,
                                                     valid_action_masks=valid_action_masks,
-                                                    embed_hydrogens=EMBED_HYDROGENS)
+                                                    embed_hydrogens=EMBED_HYDROGENS,
+                                                    torsion_angles_deg=TORSION_ANGLES_DEG)
                                   for _ in range(n_envs)]
 assert action_dim == envs[0].action_dim
 batch_env = BatchEnv(envs)
 
-agent = Agent(protected_fragments=final_fragments, 
-              hidden_irreps=hidden_irreps)
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_tfsn_d_15_02_2024_15_11_12_4500.pt')
+agent = Agent(protected_fragments=protected_fragments, 
+              hidden_irreps=HIDDEN_IRREPS)
+state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_17_02_2024_01_14_57_500.pt')
 agent.load_state_dict(state_dict)
 
 fragment_features = agent.extract_fragment_features()

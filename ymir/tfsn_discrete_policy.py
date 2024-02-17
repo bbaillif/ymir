@@ -25,12 +25,14 @@ class Agent(nn.Module):
                  hidden_irreps: o3.Irreps,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
+                 summing_embeddings: bool = False,
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
         self.hidden_irreps = hidden_irreps
         self.device = device
         self.embed_hydrogens = embed_hydrogens
+        self.summing_embeddings = summing_embeddings
         
         self.action_dim = len(self.protected_fragments)
         center_pos = [0, 0, 0]
@@ -55,15 +57,18 @@ class Agent(nn.Module):
         
         # Fragment logit + 3D vector 
         self.actor_irreps = o3.Irreps(f'1x0e')
-        self.actor_tp = o3.FullyConnectedTensorProduct(irreps_in1=hidden_irreps, 
-                                                        irreps_in2=hidden_irreps, 
-                                                        irreps_out=self.actor_irreps, 
-                                                        internal_weights=True)
+        if self.summing_embeddings:
+            self.actor = o3.Linear(self.hidden_irreps, self.actor_irreps)
+            self.actor.to(self.device)
+        else:
+            self.actor_tp = o3.FullyConnectedTensorProduct(irreps_in1=hidden_irreps, 
+                                                            irreps_in2=hidden_irreps, 
+                                                            irreps_out=self.actor_irreps, 
+                                                            internal_weights=True)
+            self.actor_tp.to(self.device)
         
         self.critic_irreps = o3.Irreps(f'1x0e')
         self.critic = o3.Linear(self.hidden_irreps, self.critic_irreps)
-        
-        self.actor_tp.to(self.device)
         self.critic.to(self.device)
 
 
@@ -108,7 +113,10 @@ class Agent(nn.Module):
         fragment_indices = fragment_indices.repeat(n_pockets)
         fragment_embeddings = fragment_features[fragment_indices]
         
-        actor_output = self.actor_tp(pocket_embeddings, fragment_embeddings)
+        if self.summing_embeddings:
+            actor_output = self.actor(pocket_embeddings + fragment_embeddings)
+        else:
+            actor_output = self.actor_tp(pocket_embeddings, fragment_embeddings)
         actor_output = actor_output.reshape(n_pockets, n_fragments)
         
         # Fragment sampling

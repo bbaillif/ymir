@@ -1,4 +1,6 @@
 import os
+import numpy as np
+from e3nn import o3
 
 ROOT_DIRPATH = '/home/bb596/hdd'
 # LIGBOUNDCONF_FILEPATH = os.path.join(ROOT, 'LigBoundConf/minimized/S2_LigBoundConf_minimized.sdf')
@@ -94,3 +96,9 @@ LMAX = 3
 
 MAX_RADIUS = 10
 EMBED_HYDROGENS = True
+N_HIDDEN_INV_FEATURES = 16
+N_HIDDEN_EQUI_FEATURES = 8
+HIDDEN_IRREPS = o3.Irreps(f'{N_HIDDEN_INV_FEATURES}x0e + {N_HIDDEN_EQUI_FEATURES}x1o + {N_HIDDEN_EQUI_FEATURES}x2e + {N_HIDDEN_EQUI_FEATURES}x3o')
+
+N_ROTATIONS = 72
+TORSION_ANGLES_DEG = np.arange(-180, 180, 360 / N_ROTATIONS)

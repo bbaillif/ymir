@@ -4,12 +4,12 @@ import logging
 
 from rdkit import Chem
 from rdkit.Chem import Mol
-from ymir.mace_molecule_builder import add_fragment_to_seed
+from ymir.molecule_builder import add_fragment_to_seed
 from ymir.utils.fragment import get_fragments_from_mol
 from ymir.data.structure.complex import Complex
 from torch_geometric.data import Data
 from ymir.data import Fragment
-from typing import Any, Sequence
+from typing import Any
 from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import euclidean
 from ymir.utils.spatial import rotate_conformer, translate_conformer
@@ -18,9 +18,6 @@ from tqdm import tqdm
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.mace_vec_policy import Action
-from ymir.metrics.activity import VinaScorer, VinaScore
-from ymir.reward import DockingBatchRewards
 from ymir.featurizer_sn import get_mol_features, get_fragment_features
 from ymir.params import EMBED_HYDROGENS
 

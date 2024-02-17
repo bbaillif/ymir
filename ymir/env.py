@@ -9,7 +9,7 @@ from ymir.utils.fragment import get_fragments_from_mol
 from ymir.data.structure.complex import Complex
 from torch_geometric.data import Data
 from ymir.data import Fragment
-from typing import Any, Sequence
+from typing import Any
 from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import euclidean
 from ymir.utils.spatial import rotate_conformer, translate_conformer
@@ -18,10 +18,8 @@ from tqdm import tqdm
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.mace_vec_policy import Action
-from ymir.metrics.activity import VinaScorer, VinaScore
-from ymir.reward import DockingBatchRewards
-from ymir.featurizer_sn import get_mol_features
+from ymir.featurizer_sn import get_mol_features, get_fragment_features
+from ymir.params import EMBED_HYDROGENS, TORSION_ANGLES_DEG
 
 
 class FragmentBuilderEnv():
@@ -31,20 +29,24 @@ class FragmentBuilderEnv():
                  z_table: AtomicNumberTable,
                  max_episode_steps: int = 10,
                  valid_action_masks: dict[int, torch.Tensor] = None,
+                 embed_hydrogens: bool = EMBED_HYDROGENS,
+                 torsion_angles_deg: list[float] = TORSION_ANGLES_DEG,
                  ) -> None:
         self.protected_fragments = protected_fragments
         self.z_table = z_table
+        self.max_episode_steps = max_episode_steps
+        self.valid_action_masks = valid_action_masks
+        self.embed_hydrogens = embed_hydrogens
+        self.torsion_angles_deg = torsion_angles_deg
+        
+        self.n_torsions = len(self.torsion_angles_deg)
         
         self.n_fragments = len(self.protected_fragments)
-        
         self._action_dim = self.n_fragments
-            
-        # else:
-        for mask in valid_action_masks.values():
-            assert mask.size()[-1] == self.action_dim
-        self.valid_action_masks = valid_action_masks
         
-        self.max_episode_steps = max_episode_steps
+        for mask in self.valid_action_masks.values():
+            assert mask.size()[-1] == self.action_dim
+
         self.seed: Fragment = None
         self.fragment: Fragment = None
         
@@ -110,42 +112,24 @@ class FragmentBuilderEnv():
         
         
     def get_new_fragment(self,
-                        frag_action: int,
-                        vector_action: torch.Tensor):
-        fragment_i = frag_action
+                        frag_action: int):
+        
+        fragment_i = frag_action // self.n_torsions
+        try:
+            protected_fragment = self.protected_fragments[fragment_i]
+        except:
+            import pdb;pdb.set_trace()
+        torsion_i = frag_action % self.n_torsions
+        torsion_value = self.torsion_angles_deg[torsion_i]
+        
         assert fragment_i < self.action_dim, 'Invalid action'
         protected_fragment = self.protected_fragments[fragment_i]
         
-        # rotation along the X axis
         new_fragment = Fragment(protected_fragment,
                                 protections=protected_fragment.protections)
         
-        # x_axis_vector = np.array([-1, 0, 0])
-        # y_axis_vector = np.array([0, 1, 0])
-        # action_vector = vector_action # should have norm = 1 on xyz
-        # action_vector[0] = 0
-        # neighbor_attach = np.array([-1, 0, 0])
-        # The fragment originates at (0, 0, 0)
-        # We imagine the original orientation vector of the fragment is (0, 1, 0)
-        # we will rotate to align this orientation vector with the action vector
-        
-        base_yz_vector = torch.tensor([1.0, 0.0])
-        action_yz_vector = vector_action[1:] # we don't need x, as we already are fixed on the x axis
-        denominator = base_yz_vector.norm() * action_yz_vector.norm()
-        cos_theta = torch.dot(base_yz_vector, action_yz_vector) / denominator
-        theta = torch.arccos(cos_theta)
-        sin_theta = torch.sin(theta)
-        
-        # Rotation on the yz plane
-        rotation_matrix = np.array([[1, 0, 0],
-                                    [0, cos_theta, -sin_theta],
-                                    [0, sin_theta, cos_theta]])
-        
-        rotation = Rotation.from_matrix(rotation_matrix)
-        
-        rotate_conformer(new_fragment.GetConformer(), rotation=rotation)
-        
-        Chem.MolToMolFile(new_fragment, 'fragment_after.mol')
+        rotation = Rotation.from_euler('x', torsion_value)
+        rotate_conformer(new_fragment.GetConformer(), rotation)
         
         return new_fragment
         
@@ -161,16 +145,15 @@ class FragmentBuilderEnv():
         translate_conformer(self.pocket_mol.GetConformer(), translation=translation)
         self.transformations.append(translation)
         
-        Chem.MolToMolFile(self.seed, 'seed_after.mol')
+        # Chem.MolToMolFile(self.seed, 'seed_after.mol')
         # Chem.MolToMolFile(self.pocket_mol, 'pocket_after.mol')
         # import pdb;pdb.set_trace()
         
         
     def action_to_fragment_build(self,
-                                 frag_action: int,
-                                 vector_action: Sequence[float]):
+                                 frag_action: int):
         
-        new_fragment = self.get_new_fragment(frag_action, vector_action)
+        new_fragment = self.get_new_fragment(frag_action)
         self.translate_seed(fragment=new_fragment)
         
         product = add_fragment_to_seed(seed=self.seed,
@@ -190,14 +173,13 @@ class FragmentBuilderEnv():
                 'seed_i': self.seed_i}
     
     
-    def featurize_pocket(self,
-                         embed_hydrogens: bool = False) -> Data:
+    def featurize_pocket(self) -> Data:
         center_pos = [0, 0, 0]
-        ligand_x, ligand_pos = get_mol_features(mol=self.seed, 
-                                                embed_hydrogens=embed_hydrogens,
+        ligand_x, ligand_pos = get_fragment_features(fragment=self.seed, 
+                                                embed_hydrogens=self.embed_hydrogens,
                                                 center_pos=center_pos)
         protein_x, protein_pos = get_mol_features(mol=self.pocket_mol,
-                                                    embed_hydrogens=embed_hydrogens,
+                                                    embed_hydrogens=self.embed_hydrogens,
                                                     center_pos=center_pos)
         
         pocket_x = protein_x + ligand_x
@@ -277,13 +259,12 @@ class FragmentBuilderEnv():
     
     
     def step(self,
-             frag_action: int,
-             vector_action: Sequence[float]):
+             frag_action: int):
         
-        self.actions.append((frag_action, vector_action))
+        self.actions.append(frag_action)
         n_actions = len(self.actions)
         
-        self.action_to_fragment_build(frag_action, vector_action) # seed is deprotected
+        self.action_to_fragment_build(frag_action) # seed is deprotected
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
@@ -718,7 +699,8 @@ class BatchEnv():
         
         
     def reset(self,
-              complexes: list[Complex]) -> tuple[list[Data], list[dict[str, Any]]]:
+              complexes: list[Complex],
+              scorer) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
@@ -732,11 +714,9 @@ class BatchEnv():
         self.terminateds = [False] * len(self.envs)
         self.ongoing_env_idxs = list(range(len(self.envs)))
         
-        Chem.MolToMolFile(complexes[0].pocket.mol, 'original_pocket.mol')
+        # Chem.MolToMolFile(complexes[0].pocket.mol, 'original_pocket.mol')
         
-        vina_scorer = VinaScorer(complx.vina_protein)
-        vina_scorer.set_box_from_ligand(complx.ligand)
-        self.scorer = VinaScore(vina_scorer=vina_scorer)
+        self.scorer = scorer
         # self.reward_function = DockingBatchRewards(complx, scorer)
         
         return batch_info
@@ -800,18 +780,16 @@ class BatchEnv():
     
     def step(self,
              frag_actions: torch.Tensor,
-             vector_actions: torch.Tensor
              ) -> tuple[list[float], list[bool], list[bool], list[dict]]:
         
         assert frag_actions.size()[0] == len(self.ongoing_env_idxs)
-        assert vector_actions.size()[0] == len(self.ongoing_env_idxs)
 
         batch_truncated = []
         batch_info = []
         mols = []
-        for env_i, frag_action, vector_action in zip(self.ongoing_env_idxs, frag_actions, vector_actions):
+        for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
-            _, terminated, truncated, info = env.step(frag_action, vector_action)
+            _, terminated, truncated, info = env.step(frag_action)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
@@ -867,13 +845,25 @@ class BatchEnv():
     
     
     def save_state(self) -> None:
+        
         save_path = 'ligands.sdf' 
-        with Chem.SDWriter(save_path) as ligand_writer, Chem.SDWriter('pockets.sdf') as pocket_writer:
+        with Chem.SDWriter(save_path) as ligand_writer:
             for env in self.envs:
                 mol_h = env.get_clean_mol()
-                clean_pocket = env.get_clean_pocket()
                 ligand_writer.write(mol_h)
+              
+        pocket_path = 'pockets.sdf'  
+        with Chem.SDWriter(pocket_path) as pocket_writer:
+            for env in self.envs:
+                clean_pocket = env.get_clean_pocket()
                 pocket_writer.write(clean_pocket)
+                
+        native_ligand_path = 'native_ligands.sdf'
+        with Chem.SDWriter(native_ligand_path) as native_writer:
+            for env in self.envs:
+                native_ligand = env.complex.ligand
+                native_writer.write(native_ligand)
+                
         # with Chem.SDWriter('pocket.sdf') as writer:   
         #     writer.write(env.complex.pocket.mol)
         # with Chem.SDWriter('native_ligand.sdf') as writer:   

@@ -19,7 +19,7 @@ from ymir.policy import Agent
 from torch.optim import Adam
 from ymir.reward import DockingBatchRewards
 from torch_geometric.data import Batch, Data
-from ymir.molecule_builder import potential_reactions
+from ymir.old.molecule_builder import potential_reactions
 from ymir.metrics.activity import GlideScore, VinaScore, VinaScorer
 
 logging.basicConfig(filename='train.log', 

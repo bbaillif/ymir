@@ -15,7 +15,7 @@ from ymir.utils.fragment import get_fragments_from_mol
 from ymir.mace_tfsn_policy import Agent
 from torch.optim import Adam
 from torch_geometric.data import Batch, Data
-from ymir.molecule_builder import potential_reactions
+from ymir.old.molecule_builder import potential_reactions
 from e3nn import o3
 from ymir.atomic_num_table import AtomicNumberTable
 from scipy.spatial.transform import Rotation

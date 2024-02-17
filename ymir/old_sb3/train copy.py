@@ -12,7 +12,7 @@ from ymir.data.fragment import (get_unique_fragments_from_mols,
 from ymir.env import FragmentBuilderEnv
 from ymir.policy import FragmentBuilderPolicy
 from ymir.params import TORSION_SPACE_STEP
-from ymir.molecule_builder import potential_reactions
+from ymir.old.molecule_builder import potential_reactions
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.ppo_mask import MaskablePPO
 from rdkit.Chem.rdMolDescriptors import CalcNumRotatableBonds
