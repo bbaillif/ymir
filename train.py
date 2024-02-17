@@ -164,10 +164,23 @@ for fragment in protected_fragments:
     translate_conformer(conformer=fragment.GetConformer(),
                         translation=translation)
 
-action_dim = len(protected_fragments)
+final_fragments = []
+for protected_fragment in protected_fragments:
+    
+    for torsion_value in TORSION_ANGLES_DEG :
+    
+        new_fragment = Fragment(protected_fragment,
+                                protections=protected_fragment.protections)
+
+        rotation = Rotation.from_euler('x', torsion_value)
+        rotate_conformer(new_fragment.GetConformer(), rotation=rotation)
+        
+        final_fragments.append(new_fragment)
+
+action_dim = len(final_fragments)
 
 fragment_attach_labels = []
-for act_i, fragment in enumerate(protected_fragments):
+for act_i, fragment in enumerate(final_fragments):
     for atom in fragment.GetAtoms():
         if atom.GetAtomicNum() == 0:
             attach_label = atom.GetIsotope()
@@ -184,9 +197,9 @@ for attach_label_1, d_potential_attach in potential_reactions.items():
              
     valid_action_masks[attach_label_1] = torch.tensor(mask, dtype=torch.bool)
 
-logging.info(f'There are {len(protected_fragments)} fragments')
+logging.info(f'There are {len(final_fragments)} fragments')
 
-envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=protected_fragments,
+envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_fragments,
                                                      z_table=z_table,
                                                     max_episode_steps=n_steps,
                                                     valid_action_masks=valid_action_masks,
