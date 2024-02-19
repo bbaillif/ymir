@@ -109,16 +109,42 @@ class FragmentBuilderEnv():
         
         
     def get_new_fragment(self,
-                        frag_action: int):
-        
+                        frag_action: int,
+                        vector_action: torch.Tensor):
         fragment_i = frag_action
-        protected_fragment = self.protected_fragments[fragment_i]
-        
         assert fragment_i < self.action_dim, 'Invalid action'
         protected_fragment = self.protected_fragments[fragment_i]
         
+        # rotation along the X axis
         new_fragment = Fragment(protected_fragment,
                                 protections=protected_fragment.protections)
+        
+        # x_axis_vector = np.array([-1, 0, 0])
+        # y_axis_vector = np.array([0, 1, 0])
+        # action_vector = vector_action # should have norm = 1 on xyz
+        # action_vector[0] = 0
+        # neighbor_attach = np.array([-1, 0, 0])
+        # The fragment originates at (0, 0, 0)
+        # We imagine the original orientation vector of the fragment is (0, 1, 0)
+        # we will rotate to align this orientation vector with the action vector
+        
+        base_yz_vector = torch.tensor([1.0, 0.0])
+        action_yz_vector = vector_action[1:] # we don't need x, as we already are fixed on the x axis
+        denominator = base_yz_vector.norm() * action_yz_vector.norm()
+        cos_theta = torch.dot(base_yz_vector, action_yz_vector) / denominator
+        theta = torch.arccos(cos_theta)
+        sin_theta = torch.sin(theta)
+        
+        # Rotation on the yz plane
+        rotation_matrix = np.array([[1, 0, 0],
+                                    [0, cos_theta, -sin_theta],
+                                    [0, sin_theta, cos_theta]])
+        
+        rotation = Rotation.from_matrix(rotation_matrix)
+        
+        rotate_conformer(new_fragment.GetConformer(), rotation=rotation)
+        
+        Chem.MolToMolFile(new_fragment, 'fragment_after.mol')
         
         return new_fragment
         
@@ -140,9 +166,10 @@ class FragmentBuilderEnv():
         
         
     def action_to_fragment_build(self,
-                                 frag_action: int):
+                                 frag_action: int,
+                                 vector_action: list[float]):
         
-        new_fragment = self.get_new_fragment(frag_action)
+        new_fragment = self.get_new_fragment(frag_action, vector_action)
         self.translate_seed(fragment=new_fragment)
         
         product = add_fragment_to_seed(seed=self.seed,
@@ -241,12 +268,13 @@ class FragmentBuilderEnv():
     
     
     def step(self,
-             frag_action: int):
+             frag_action: int,
+             vector_action: list[float]):
         
-        self.actions.append(frag_action)
+        self.actions.append((frag_action, vector_action))
         n_actions = len(self.actions)
         
-        self.action_to_fragment_build(frag_action) # seed is deprotected
+        self.action_to_fragment_build(frag_action, vector_action) # seed is deprotected
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
@@ -762,16 +790,18 @@ class BatchEnv():
     
     def step(self,
              frag_actions: torch.Tensor,
+             vector_actions: torch.Tensor
              ) -> tuple[list[float], list[bool], list[bool], list[dict]]:
         
         assert frag_actions.size()[0] == len(self.ongoing_env_idxs)
+        assert vector_actions.size()[0] == len(self.ongoing_env_idxs)
 
         batch_truncated = []
         batch_info = []
         mols = []
-        for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
+        for env_i, frag_action, vector_action in zip(self.ongoing_env_idxs, frag_actions, vector_actions):
             env = self.envs[env_i]
-            _, terminated, truncated, info = env.step(frag_action)
+            _, terminated, truncated, info = env.step(frag_action, vector_action)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True

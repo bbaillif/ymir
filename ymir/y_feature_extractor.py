@@ -5,7 +5,6 @@ from torch_scatter import scatter
 from e3nn.math import (soft_one_hot_linspace,
                        soft_unit_step)
 from e3nn import o3
-from e3nn.nn import FullyConnectedNet
 from torch_geometric.data import Batch
 from ymir.params import MAX_RADIUS
 from ymir.atomic_num_table import AtomicNumberTable
@@ -44,8 +43,9 @@ class YFeatureExtractor(torch.nn.Module):
             
         self.element_dist_shell_tp = o3.FullTensorProduct(irreps_in1=self.element_shell_tp.irreps_out, 
                                                        irreps_in2=self.irreps_basis)
-            
-        self.irreps_out = self.element_dist_shell_tp.irreps_out
+        
+        self.self_tp = o3.TensorSquare(irreps_in=self.element_dist_shell_tp.irreps_out)
+        self.irreps_out = self.self_tp.irreps_out
     
     def forward(self,
                 batch: Batch):
@@ -77,10 +77,14 @@ class YFeatureExtractor(torch.nn.Module):
         else:
             reduce = 'mean'
         
-        output = scatter(src=element_dist_shell,
+        readout = scatter(src=element_dist_shell,
                          index=batch.batch, 
                          dim=0,
                          reduce=reduce)
+        
+        output = self.self_tp(readout)
+        
+        # import pdb;pdb.set_trace()
 
         return output
     

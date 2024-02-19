@@ -25,7 +25,7 @@ from ymir.utils.spatial import (rotate_conformer,
                                 translate_conformer)
 from ymir.env import (FragmentBuilderEnv, 
                             BatchEnv)
-from ymir.policy import Agent
+from ymir.policy import Agent, Action
 from ymir.data import Fragment
 from ymir.params import (EMBED_HYDROGENS, 
                          TORSION_ANGLES_DEG)
@@ -47,11 +47,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 16 # we will have protein envs in parallel
+n_envs = 128 # we will have protein envs in parallel
 batch_size = n_envs # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 5e-4
+lr = 1e-3
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -150,7 +150,7 @@ for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_com
             if 7 in attach_points.values():
                 raise Exception("double bond BRICS, we don't include these")
         assert len(fragments) > 1, 'Ligand is not fragmentable (or double bond reaction)'
-        vina_scorer = VinaScorer(complx.vina_protein)
+        vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
         # vina_scorer.set_box_from_ligand(complx.ligand)
         # vina_score = VinaScore(vina_scorer=vina_scorer)
     except Exception as e:
@@ -195,19 +195,7 @@ for fragment in protected_fragments:
     translate_conformer(conformer=fragment.GetConformer(),
                         translation=translation)
 
-final_fragments = []
-for protected_fragment in protected_fragments:
-    
-    for torsion_value in TORSION_ANGLES_DEG :
-    
-        new_fragment = Fragment(protected_fragment,
-                                protections=protected_fragment.protections)
-
-        rotation = Rotation.from_euler('x', torsion_value)
-        rotate_conformer(new_fragment.GetConformer(), rotation=rotation)
-        
-        final_fragments.append(new_fragment)
-
+final_fragments = protected_fragments
 action_dim = len(final_fragments)
 
 fragment_attach_labels = []
@@ -239,12 +227,11 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
 assert action_dim == envs[0].action_dim
 batch_env = BatchEnv(envs)
 
-agent = Agent(protected_fragments=final_fragments, 
-              atomic_num_table=z_table)
+agent = Agent(action_dim=action_dim, 
+              atomic_num_table=z_table,
+              summing_embeddings=True)
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_17_02_2024_01_14_57_500.pt')
 # agent.load_state_dict(state_dict)
-
-fragment_features = agent.extract_fragment_features()
 
 optimizer = Adam(agent.parameters(), lr=lr)
 
@@ -276,6 +263,8 @@ try:
         obs: list[list[Data]] = []
         frag_actions: list[torch.Tensor] = [] # (n_non_term_envs)
         frag_logprobs: list[torch.Tensor] = [] # (n_non_term_envs)
+        vector_actions: list[torch.Tensor] = [] # (n_non_term_envs)
+        vector_logprobs: list[torch.Tensor] = [] # (n_non_term_envs)
         values: list[torch.Tensor] = [] # (n_non_term_envs)
         masks: list[torch.Tensor] = [] # (n_non_term_envs, action_dim)
         terminateds: list[list[bool]] = [] # (n_steps, n_envs)
@@ -304,19 +293,26 @@ try:
                 features = agent.extract_features(x)
                 current_masks = current_masks.to(device)
                 
-                current_action = agent.get_action(features, 
-                                                  fragment_features=fragment_features,
-                                                    masks=current_masks)
+                current_action: Action = agent.get_action(features,
+                                                            masks=current_masks)
                 current_frag_actions = current_action.frag_i
                 current_frag_actions = current_frag_actions.cpu()
+                current_vector_actions = current_action.vector.cpu()
                 current_values = agent.get_value(features)
                 current_values = current_values.squeeze(dim=-1)
                 
             frag_actions.append(current_frag_actions)
             frag_logprobs.append(current_action.frag_logprob.cpu())
+            vector_actions.append(current_vector_actions)
+            vector_logprobs.append(current_action.vector_logprob.cpu())
             values.append(current_values.cpu())
             
-            t = batch_env.step(frag_actions=current_frag_actions)
+            # only select the vector info of the selected fragment
+            arange = torch.arange(current_vector_actions.shape[0])
+            current_vector_actions = current_vector_actions[arange, current_frag_actions]
+            
+            t = batch_env.step(frag_actions=current_frag_actions,
+                               vector_actions=current_vector_actions)
             
             logging.info(current_frag_actions)
             
@@ -390,6 +386,8 @@ try:
         
         b_frag_actions = torch.cat(frag_actions)
         b_frag_logprobs = torch.cat(frag_logprobs)
+        b_vector_actions = torch.cat(vector_actions)
+        b_vector_logprobs = torch.cat(vector_logprobs)
         b_advantages = torch.cat(advantages)
         b_returns = torch.cat(returns)
         b_values = torch.cat(values)
@@ -419,6 +417,7 @@ try:
                     
                     mb_obs = [b_obs[i] for i in minibatch_inds]
                     mb_frag_actions = b_frag_actions[minibatch_inds]
+                    mb_vector_actions = b_vector_actions[minibatch_inds]
                     mb_masks = b_masks[minibatch_inds]
                     
                     x = Batch.from_data_list(mb_obs)
@@ -427,10 +426,11 @@ try:
                     
                     current_masks = mb_masks.to(device)
                     current_frag_actions = mb_frag_actions.to(device)
+                    current_vector_actions = mb_vector_actions.to(device)
                     current_action = agent.get_action(features=features,
-                                                      fragment_features=fragment_features,
                                                         masks=current_masks,
-                                                        frag_actions=current_frag_actions)
+                                                        frag_actions=current_frag_actions,
+                                                        vector_actions=current_vector_actions)
                     
                     current_frag_logprobs = current_action.frag_logprob
                     current_frag_entropy = current_action.frag_entropy
@@ -448,6 +448,25 @@ try:
                     frag_pg_loss = torch.max(frag_pg_loss1, frag_pg_loss2).mean()
                     frag_entropy_loss = current_frag_entropy.mean()
                     
+                     # only select the vector info of the selected fragment
+                    arange = torch.arange(current_vector_actions.shape[0]).to(device)
+                    current_vector_logprobs = current_action.vector_logprob
+                    current_vector_logprobs = current_vector_logprobs[arange, current_frag_actions]
+                    
+                    mb_vector_logprobs = b_vector_logprobs[minibatch_inds]
+                    mb_vector_logprobs = mb_vector_logprobs.to(device)
+                    mb_vector_logprobs = mb_vector_logprobs[arange, current_frag_actions]
+                    
+                    vector_ratio = (current_vector_logprobs - mb_vector_logprobs).exp()
+                    
+                    vector_approx_kl = (mb_vector_logprobs - current_vector_logprobs).mean()
+                    
+                    vector_pg_loss1 = -mb_advantages * vector_ratio
+                    vector_pg_loss2 = -mb_advantages * torch.clamp(vector_ratio, 
+                                                            min=1 - clip_coef, 
+                                                            max=1 + clip_coef)
+                    vector_pg_loss = torch.max(vector_pg_loss1, vector_pg_loss2).mean()
+                    
                     mb_returns = b_returns[minibatch_inds]
                     mb_values = b_values[minibatch_inds]
                     mb_returns = mb_returns.to(device)
@@ -461,7 +480,7 @@ try:
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                     
-                    loss = frag_pg_loss + (v_loss * vf_coef) 
+                    loss = frag_pg_loss + vector_pg_loss + (v_loss * vf_coef) 
                     loss = loss - (ent_coef * frag_entropy_loss)
                     
                     optimizer.zero_grad()
@@ -470,9 +489,6 @@ try:
                     nn.utils.clip_grad_value_(parameters=agent.parameters(), 
                                             clip_value=max_grad_value)
                     optimizer.step()
-                    
-                    # Reload fragment_features
-                    fragment_features = agent.extract_fragment_features()
         
         logging.info(f'Second loop time: {time.time() - start_time}')
                 
@@ -481,12 +497,12 @@ try:
         writer.add_scalar("losses/fragment_policy_loss", frag_pg_loss.item(), episode_i)
         writer.add_scalar("losses/fragment_entropy", frag_entropy_loss.mean().item(), episode_i)
         writer.add_scalar("losses/fragment_approx_kl", frag_approx_kl.item(), episode_i)
+        writer.add_scalar("losses/vector_policy_loss", vector_pg_loss.item(), episode_i)
+        writer.add_scalar("losses/vector_approx_kl", vector_approx_kl.item(), episode_i)
         writer.add_scalar("losses/loss", loss.item(), episode_i)
         
         flat_rewards = torch.cat(rewards)
         writer.add_scalar("reward/mean_reward", flat_rewards.mean(), episode_i)
-        
-        # import pdb;pdb.set_trace()
         
         if ((episode_i + 1) % 500 == 0):
             save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt'
