@@ -18,8 +18,8 @@ from tqdm import tqdm
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.featurizer_sn import get_mol_features, get_fragment_features
 from ymir.params import EMBED_HYDROGENS, TORSION_ANGLES_DEG
+from ymir.featurizer_sn import Featurizer
 
 
 class FragmentBuilderEnv():
@@ -30,16 +30,12 @@ class FragmentBuilderEnv():
                  max_episode_steps: int = 10,
                  valid_action_masks: dict[int, torch.Tensor] = None,
                  embed_hydrogens: bool = EMBED_HYDROGENS,
-                 torsion_angles_deg: list[float] = TORSION_ANGLES_DEG,
                  ) -> None:
         self.protected_fragments = protected_fragments
         self.z_table = z_table
         self.max_episode_steps = max_episode_steps
         self.valid_action_masks = valid_action_masks
         self.embed_hydrogens = embed_hydrogens
-        self.torsion_angles_deg = torsion_angles_deg
-        
-        self.n_torsions = len(self.torsion_angles_deg)
         
         self.n_fragments = len(self.protected_fragments)
         self._action_dim = self.n_fragments
@@ -51,6 +47,7 @@ class FragmentBuilderEnv():
         self.fragment: Fragment = None
         
         self.geometry_extractor = GeometryExtractor()
+        self.featurizer = Featurizer(z_table=self.z_table)
         
     @property
     def action_dim(self) -> int:
@@ -114,22 +111,14 @@ class FragmentBuilderEnv():
     def get_new_fragment(self,
                         frag_action: int):
         
-        fragment_i = frag_action // self.n_torsions
-        try:
-            protected_fragment = self.protected_fragments[fragment_i]
-        except:
-            import pdb;pdb.set_trace()
-        torsion_i = frag_action % self.n_torsions
-        torsion_value = self.torsion_angles_deg[torsion_i]
+        fragment_i = frag_action
+        protected_fragment = self.protected_fragments[fragment_i]
         
         assert fragment_i < self.action_dim, 'Invalid action'
         protected_fragment = self.protected_fragments[fragment_i]
         
         new_fragment = Fragment(protected_fragment,
                                 protections=protected_fragment.protections)
-        
-        rotation = Rotation.from_euler('x', torsion_value)
-        rotate_conformer(new_fragment.GetConformer(), rotation)
         
         return new_fragment
         
@@ -175,27 +164,20 @@ class FragmentBuilderEnv():
     
     def featurize_pocket(self) -> Data:
         center_pos = [0, 0, 0]
-        ligand_x, ligand_pos = get_fragment_features(fragment=self.seed, 
-                                                embed_hydrogens=self.embed_hydrogens,
-                                                center_pos=center_pos)
-        protein_x, protein_pos = get_mol_features(mol=self.pocket_mol,
-                                                    embed_hydrogens=self.embed_hydrogens,
-                                                    center_pos=center_pos)
+        ligand_x, ligand_pos = self.featurizer.get_fragment_features(fragment=self.seed, 
+                                                                    embed_hydrogens=self.embed_hydrogens,
+                                                                    center_pos=center_pos)
+        protein_x, protein_pos = self.featurizer.get_mol_features(mol=self.pocket_mol,
+                                                                embed_hydrogens=self.embed_hydrogens,
+                                                                center_pos=center_pos)
         
         pocket_x = protein_x + ligand_x
         pocket_pos = protein_pos + ligand_pos
         
-        # Get indices of from the list of atomic_numbers in the input ztable
-        pocket_x = [self.z_table.z_to_index(z) for z in pocket_x]
-        
-        mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
-        
         x = torch.tensor(pocket_x, dtype=torch.long)
         pos = torch.tensor(pocket_pos, dtype=torch.float)
-        mol_id = torch.tensor(mol_id)
         data = Data(x=x,
-                    pos=pos,
-                    mol_id=mol_id)
+                    pos=pos)
 
         return data
     

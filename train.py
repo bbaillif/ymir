@@ -7,6 +7,8 @@ import logging
 from torch import nn
 from tqdm import tqdm
 from rdkit import Chem
+from rdkit.Chem import Mol
+from typing import Union
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import Adam
@@ -19,12 +21,14 @@ from ymir.data.structure import Complex
 from ymir.utils.fragment import get_fragments_from_mol
 from ymir.molecule_builder import potential_reactions
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.utils.spatial import rotate_conformer, translate_conformer
+from ymir.utils.spatial import (rotate_conformer, 
+                                translate_conformer)
 from ymir.env import (FragmentBuilderEnv, 
                             BatchEnv)
 from ymir.policy import Agent
 from ymir.data import Fragment
-from ymir.params import EMBED_HYDROGENS, HIDDEN_IRREPS, TORSION_ANGLES_DEG
+from ymir.params import (EMBED_HYDROGENS, 
+                         TORSION_ANGLES_DEG)
 from ymir.metrics.activity import VinaScore, VinaScorer
 
 logging.basicConfig(filename='train.log', 
@@ -43,7 +47,7 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 64 # we will have protein envs in parallel
+n_envs = 16 # we will have protein envs in parallel
 batch_size = n_envs # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
@@ -56,7 +60,7 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 500
+n_complexes = 5
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -74,6 +78,42 @@ ligands = [ligand
 
 random.shuffle(ligands)
 
+def select_mol_with_symbols(mols: list[Union[Mol, Fragment]],
+                            z_list: list[int]):
+    mol_is_included = []
+    for mol in mols:
+        if isinstance(mol, Fragment):
+            frag = Fragment(mol=mol,
+                            protections=mol.protections)
+            frag.unprotect()
+            mol = frag
+        mol = Chem.RemoveHs(mol)
+        included = True
+        for atom in mol.GetAtoms():
+            z = atom.GetAtomicNum()
+            if z not in z_list:
+                included = False
+                break
+        mol_is_included.append(included)
+        
+    out_mols = [mol 
+                for mol, included in zip(mols, mol_is_included)
+                if included]
+    
+    return out_mols
+
+z_list = [0, 6, 7, 8, 16, 17]
+if EMBED_HYDROGENS:
+    z_list.append(1)
+z_table = AtomicNumberTable(zs=z_list)
+# Remove ligands having at least one heavy atom not in list
+ligands = select_mol_with_symbols(ligands,
+                                  z_list)
+
+# Remove fragment having at least one heavy atom not in list
+protected_fragments = select_mol_with_symbols(protected_fragments,
+                                              z_list)
+
 # Select only fragments with less than 3 attach points
 n_attaches = []
 for fragment in protected_fragments:
@@ -87,7 +127,7 @@ for fragment in protected_fragments:
 protected_fragments = [fragment 
                        for fragment, n in zip(protected_fragments, n_attaches)
                        if n <= 3]
-
+            
 protein_paths = []
 for ligand in ligands:
     pdb_id = ligand.GetProp('PDB_ID')
@@ -119,15 +159,6 @@ for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_com
     else:
         complexes.append(complx)
         # vina_scores.append(vina_score)
-
-set_atomic_nums = set()
-for fragment in protected_fragments:
-    for atom in fragment.GetAtoms():
-        atomic_num = atom.GetAtomicNum()
-        set_atomic_nums.add(atomic_num)
-set_atomic_nums.add(53)
-
-z_table = AtomicNumberTable(zs=list(set_atomic_nums))
 
 # TO CHANGE/REMOVE
 n_fragments = 500
@@ -203,16 +234,15 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
                                                      z_table=z_table,
                                                     max_episode_steps=n_steps,
                                                     valid_action_masks=valid_action_masks,
-                                                    embed_hydrogens=EMBED_HYDROGENS,
-                                                    torsion_angles_deg=TORSION_ANGLES_DEG)
+                                                    embed_hydrogens=EMBED_HYDROGENS)
                                   for _ in range(n_envs)]
 assert action_dim == envs[0].action_dim
 batch_env = BatchEnv(envs)
 
-agent = Agent(protected_fragments=protected_fragments, 
-              hidden_irreps=HIDDEN_IRREPS)
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_17_02_2024_01_14_57_500.pt')
-agent.load_state_dict(state_dict)
+agent = Agent(protected_fragments=final_fragments, 
+              atomic_num_table=z_table)
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_17_02_2024_01_14_57_500.pt')
+# agent.load_state_dict(state_dict)
 
 fragment_features = agent.extract_fragment_features()
 
