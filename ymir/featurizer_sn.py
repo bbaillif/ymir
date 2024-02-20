@@ -35,11 +35,10 @@ class Featurizer():
                 if not embed_hydrogens:
                     embed = False
             if embed:
-                idx = self.z_table.z_to_index(atomic_num)
-                one_hot = [0] * len(self.z_table)
-                one_hot[idx] = 1
-                x.append(one_hot)
-                pos.append(atom_pos.tolist())
+                if atomic_num in self.z_table.zs:
+                    idx = self.z_table.z_to_index(atomic_num)
+                    x.append(idx)
+                    pos.append(atom_pos.tolist())
         
         return x, pos
 

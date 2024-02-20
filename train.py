@@ -28,7 +28,7 @@ from ymir.env import (FragmentBuilderEnv,
 from ymir.policy import Agent, Action
 from ymir.data import Fragment
 from ymir.params import (EMBED_HYDROGENS, 
-                         TORSION_ANGLES_DEG)
+                         HIDDEN_IRREPS)
 from ymir.metrics.activity import VinaScore, VinaScorer
 
 logging.basicConfig(filename='train.log', 
@@ -47,11 +47,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 128 # we will have protein envs in parallel
-batch_size = n_envs # NN batch, input is Data, output are actions + predicted reward
+n_envs = 32 # we will have protein envs in parallel
+batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 1e-1
+lr = 1e-4
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -60,7 +60,7 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 5
+n_complexes = 50
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -229,9 +229,9 @@ batch_env = BatchEnv(envs)
 
 agent = Agent(action_dim=action_dim, 
               atomic_num_table=z_table,
-              summing_embeddings=False)
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
-agent.load_state_dict(state_dict)
+              irreps_features=HIDDEN_IRREPS)
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
+# agent.load_state_dict(state_dict)
 
 optimizer = Adam(agent.parameters(), lr=lr)
 

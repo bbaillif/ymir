@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Batch
 from e3nn import o3
-from ymir.y_feature_extractor import YFeatureExtractor
+from ymir.model.transformer import Transformer
 from ymir.distribution import CategoricalMasked
 from typing import NamedTuple
 from ymir.params import (EMBED_HYDROGENS, 
@@ -24,26 +24,24 @@ class Agent(nn.Module):
     def __init__(self, 
                  action_dim: int,
                  atomic_num_table: AtomicNumberTable,
+                 irreps_features: o3.Irreps,
                  lmax: int = LMAX,
                  max_radius: float = MAX_RADIUS,
                  device: torch.device = torch.device('cuda'),
-                 embed_hydrogens: bool = EMBED_HYDROGENS,
-                 summing_embeddings: bool = False
+                 embed_hydrogens: bool = EMBED_HYDROGENS
                  ):
         super(Agent, self).__init__()
         self.action_dim = action_dim
         self.z_table = atomic_num_table
+        self.irreps_features = irreps_features
         self.lmax = lmax
         self.max_radius = max_radius
         self.device = device
         self.embed_hydrogens = embed_hydrogens
-        self.summing_embeddings = summing_embeddings
         
-        self.feature_extractor = YFeatureExtractor(atomic_num_table=self.z_table,
-                                                   lmax=self.lmax,
-                                                   max_radius=self.max_radius,
-                                                   summing_embeddings=self.summing_embeddings)
-        self.irreps_features = self.feature_extractor.irreps_out
+        self.feature_extractor = Transformer(irreps_output=self.irreps_features,
+                                             num_elements=len(self.z_table),
+                                             max_radius=self.max_radius)
         self.feature_extractor = self.feature_extractor.to(self.device)
         
         # Fragment logit + 3D vector 
