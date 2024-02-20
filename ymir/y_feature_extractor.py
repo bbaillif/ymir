@@ -39,12 +39,16 @@ class YFeatureExtractor(torch.nn.Module):
                                         normalization="component")
         
         self.element_shell_tp = o3.FullTensorProduct(irreps_in1=self.irreps_z, 
-                                                  irreps_in2=self.irreps_sh)
+                                                  irreps_in2=self.irreps_sh,
+                                                  irrep_normalization='component')
             
         self.element_dist_shell_tp = o3.FullTensorProduct(irreps_in1=self.element_shell_tp.irreps_out, 
-                                                       irreps_in2=self.irreps_basis)
+                                                       irreps_in2=self.irreps_basis,
+                                                       irrep_normalization='component')
         
-        self.self_tp = o3.TensorSquare(irreps_in=self.element_dist_shell_tp.irreps_out)
+        self.self_tp = o3.FullTensorProduct(irreps_in1=self.element_dist_shell_tp.irreps_out,
+                                            irreps_in2=self.element_dist_shell_tp.irreps_out,
+                                            irrep_normalization='component')
         self.irreps_out = self.self_tp.irreps_out
     
     def forward(self,
@@ -82,7 +86,7 @@ class YFeatureExtractor(torch.nn.Module):
                          dim=0,
                          reduce=reduce)
         
-        output = self.self_tp(readout)
+        output = self.self_tp(readout, readout)
         
         # import pdb;pdb.set_trace()
 

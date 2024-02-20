@@ -51,7 +51,7 @@ n_envs = 128 # we will have protein envs in parallel
 batch_size = n_envs # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 1e-3
+lr = 1e-1
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -229,9 +229,9 @@ batch_env = BatchEnv(envs)
 
 agent = Agent(action_dim=action_dim, 
               atomic_num_table=z_table,
-              summing_embeddings=True)
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_17_02_2024_01_14_57_500.pt')
-# agent.load_state_dict(state_dict)
+              summing_embeddings=False)
+state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
+agent.load_state_dict(state_dict)
 
 optimizer = Adam(agent.parameters(), lr=lr)
 
@@ -295,14 +295,14 @@ try:
                 
                 current_action: Action = agent.get_action(features,
                                                             masks=current_masks)
-                current_frag_actions = current_action.frag_i
-                current_frag_actions = current_frag_actions.cpu()
+                current_frag_actions = current_action.frag_i.cpu()
+                current_frag_logprobs = current_action.frag_logprob.cpu()
                 current_vector_actions = current_action.vector.cpu()
                 current_values = agent.get_value(features)
                 current_values = current_values.squeeze(dim=-1)
                 
             frag_actions.append(current_frag_actions)
-            frag_logprobs.append(current_action.frag_logprob.cpu())
+            frag_logprobs.append(current_frag_logprobs)
             vector_actions.append(current_vector_actions)
             vector_logprobs.append(current_action.vector_logprob.cpu())
             values.append(current_values.cpu())
@@ -315,6 +315,7 @@ try:
                                vector_actions=current_vector_actions)
             
             logging.info(current_frag_actions)
+            logging.info(current_frag_logprobs.exp())
             
             reward, next_terminated, next_truncated, next_info = t
             
