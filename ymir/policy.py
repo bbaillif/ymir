@@ -24,7 +24,8 @@ class Agent(nn.Module):
     def __init__(self, 
                  action_dim: int,
                  atomic_num_table: AtomicNumberTable,
-                 irreps_features: o3.Irreps,
+                 irreps_pocket_features: o3.Irreps,
+                 irreps_fragment_features: o3.Irreps,
                  lmax: int = LMAX,
                  max_radius: float = MAX_RADIUS,
                  device: torch.device = torch.device('cuda'),
@@ -33,19 +34,28 @@ class Agent(nn.Module):
         super(Agent, self).__init__()
         self.action_dim = action_dim
         self.z_table = atomic_num_table
-        self.irreps_features = irreps_features
+        self.irreps_pocket_features = irreps_pocket_features
+        self.irreps_fragment_features = irreps_fragment_features
         self.lmax = lmax
         self.max_radius = max_radius
         self.device = device
         self.embed_hydrogens = embed_hydrogens
         
-        self.feature_extractor = Transformer(irreps_output=self.irreps_features,
-                                             num_elements=len(self.z_table),
-                                             max_radius=self.max_radius)
-        self.feature_extractor = self.feature_extractor.to(self.device)
+        self.pocket_feature_extractor = Transformer(irreps_output=self.irreps_pocket_features,
+                                                    num_elements=len(self.z_table),
+                                                    max_radius=self.max_radius)
+        self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
+        
+        # self.fragment_feature_extractor = Transformer(irreps_output=self.irreps_fragment_features,
+        #                                             num_elements=len(self.z_table),
+        #                                             max_radius=self.max_radius)
+        # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
+        
+        self.fragment_features = torch.nn.Parameter(torch.randn(self.action_dim, 
+                                                                self.irreps_fragment_features.dim))
         
         # Fragment logit + 3D vector 
-        self.actor_irreps = o3.Irreps(f'{self.action_dim}x0e + {self.action_dim}x1o')
+        self.actor_irreps = o3.Irreps(f'{self.action_dim}x0e')
         self.actor = o3.Linear(irreps_in=self.irreps_features, 
                                 irreps_out=self.actor_irreps)
         self.actor.to(self.device)
