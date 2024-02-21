@@ -60,7 +60,7 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 50
+n_complexes = 1
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -227,9 +227,8 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
 assert action_dim == envs[0].action_dim
 batch_env = BatchEnv(envs)
 
-agent = Agent(action_dim=action_dim, 
-              atomic_num_table=z_table,
-              irreps_features=HIDDEN_IRREPS)
+agent = Agent(protected_fragments=final_fragments,
+              atomic_num_table=z_table)
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
 # agent.load_state_dict(state_dict)
 
