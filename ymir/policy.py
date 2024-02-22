@@ -51,13 +51,15 @@ class Agent(nn.Module):
         self.action_dim = self.n_fragments * self.n_rotations
         
         self.pocket_feature_extractor = MACE(hidden_irreps=self.irreps_pocket_features,
-                                            num_elements=len(self.z_table),
-                                            r_max=6.0)
+                                            num_elements=len(self.z_table))
         # self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
         
-        self.fragment_feature_extractor = MACE(hidden_irreps=self.irreps_fragment_features,
-                                                num_elements=len(self.z_table),
-                                                r_max=6.0)
+        self.fragment_feature_extractor = self.pocket_feature_extractor
+        self.irreps_fragment_features = self.irreps_pocket_features
+        
+        # self.fragment_feature_extractor = MACE(hidden_irreps=self.irreps_fragment_features,
+        #                                         num_elements=len(self.z_table),
+        #                                         r_max=6.0)
         # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
         
         # self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
@@ -127,6 +129,8 @@ class Agent(nn.Module):
             
         frag_logits = self.get_logits(features, fragment_features)
         
+        # import pdb;pdb.set_trace()
+        
         masks = torch.repeat_interleave(masks, self.n_rotations, dim=1)
         
         # Fragment sampling
@@ -150,6 +154,7 @@ class Agent(nn.Module):
     def get_logits(self,
                    features: torch.Tensor,
                    fragment_features: torch.Tensor) -> torch.Tensor:
+        
         n_pockets = features.shape[0]
         
         # Apply fragment rotations

@@ -56,12 +56,12 @@ gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
 clip_coef = 0.5
-ent_coef = 0.005
+ent_coef = 0.01
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 10
-use_entropy_loss = False
+n_complexes = 1
+use_entropy_loss = True
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -127,7 +127,7 @@ for fragment in protected_fragments:
 
 protected_fragments = [fragment 
                        for fragment, n in zip(protected_fragments, n_attaches)
-                       if n <= 2]
+                       if n == 1]
             
 protein_paths = []
 for ligand in ligands:
@@ -228,7 +228,7 @@ batch_env = BatchEnv(envs)
 
 agent = Agent(protected_fragments=final_fragments,
               atomic_num_table=z_table)
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_22_02_2024_21_24_07_500.pt')
 # agent.load_state_dict(state_dict)
 
 agent = agent.to(device)
@@ -291,7 +291,6 @@ try:
                 x.to(device)
                 features = agent.extract_features(x)
                 current_masks = current_masks.to(device)
-                
                 current_action: Action = agent.get_action(features,
                                                           fragment_features,
                                                             masks=current_masks)
