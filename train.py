@@ -51,16 +51,17 @@ n_envs = 32 # we will have protein envs in parallel
 batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 1e-3
+lr = 5e-4
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
 clip_coef = 0.5
-ent_coef = 0.01
+ent_coef = 0.005
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 1
+n_complexes = 10
+use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -161,7 +162,7 @@ for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_com
         # vina_scores.append(vina_score)
 
 # TO CHANGE/REMOVE
-n_fragments = 100
+n_fragments = 500
 random.shuffle(protected_fragments)
 protected_fragments = protected_fragments[:n_fragments]
 
@@ -450,7 +451,8 @@ try:
                     v_loss = 0.5 * v_loss_max.mean()
                     
                     loss = frag_pg_loss + (v_loss * vf_coef) 
-                    # loss = loss - (ent_coef * frag_entropy_loss)
+                    if use_entropy_loss:
+                        loss = loss - (ent_coef * frag_entropy_loss)
                     
                     optimizer.zero_grad()
                     loss.backward()

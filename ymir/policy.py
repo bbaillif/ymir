@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Batch
 from e3nn import o3
-from ymir.model.transformer import Transformer
+from ymir.model import MACE
 from ymir.distribution import CategoricalMasked
 from typing import NamedTuple, Sequence
 from ymir.params import (EMBED_HYDROGENS, 
@@ -14,7 +14,8 @@ from ymir.params import (EMBED_HYDROGENS,
                          IRREPS_FRAGMENTS)
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
-from pyro.distributions import ProjectedNormal
+from ymir.featurizer_sn import Featurizer
+from torch_geometric.data import Data, Batch
     
 class Action(NamedTuple): 
     frag_i: torch.Tensor # (batch_size)
@@ -49,18 +50,28 @@ class Agent(nn.Module):
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments * self.n_rotations
         
-        self.pocket_feature_extractor = Transformer(irreps_output=self.irreps_pocket_features,
-                                                    num_elements=len(self.z_table),
-                                                    max_radius=self.max_radius)
+        self.pocket_feature_extractor = MACE(hidden_irreps=self.irreps_pocket_features,
+                                            num_elements=len(self.z_table),
+                                            r_max=6.0)
         # self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
         
-        # self.fragment_feature_extractor = Transformer(irreps_output=self.irreps_fragment_features,
-        #                                             num_elements=len(self.z_table),
-        #                                             max_radius=self.max_radius)
+        self.fragment_feature_extractor = MACE(hidden_irreps=self.irreps_fragment_features,
+                                                num_elements=len(self.z_table),
+                                                r_max=6.0)
         # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
         
-        self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
-                                                    requires_grad=False)
+        # self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
+        #                                             requires_grad=True)
+        self.featurizer = Featurizer(z_table=self.z_table)
+        center_pos = [0,0,0]
+        data_list = []
+        for fragment in self.protected_fragments:
+            x, pos = self.featurizer.get_fragment_features(fragment, center_pos)
+            data = Data(x=torch.tensor(x, dtype=torch.float),
+                        pos=torch.tensor(pos, dtype=torch.float))
+            data_list.append(data)
+        self.fragment_features = Batch.from_data_list(data_list)
+        self.fragment_features = self.fragment_features.to(self.device)
         
         # Fragment logit + 3D vector 
         self.actor_irreps = o3.Irreps(f'1x0e')
@@ -100,7 +111,9 @@ class Agent(nn.Module):
     
     
     def extract_fragment_features(self):
-        fragment_embeddings = torch.einsum('bi,rji->brj', self.fragment_features, self.d_irreps_fragment)
+        fragment_features = self.fragment_feature_extractor(self.fragment_features)
+        # fragment_embeddings = torch.einsum('bi,rji->brj', self.fragment_features, self.d_irreps_fragment)
+        fragment_embeddings = torch.einsum('bi,rji->brj', fragment_features, self.d_irreps_fragment)
         fragment_embeddings = fragment_embeddings.reshape(-1, self.irreps_fragment_features.dim) # (n_fragment*n_rotations, irreps_dim)
         return fragment_embeddings
     
@@ -112,6 +125,31 @@ class Agent(nn.Module):
                    frag_actions: torch.Tensor = None # (action_dim)
                    ) -> Action:
             
+        frag_logits = self.get_logits(features, fragment_features)
+        
+        masks = torch.repeat_interleave(masks, self.n_rotations, dim=1)
+        
+        # Fragment sampling
+        if torch.isnan(frag_logits).any():
+            print('NAN logits')
+            import pdb;pdb.set_trace()
+        frag_categorical = CategoricalMasked(logits=frag_logits,
+                                            masks=masks)
+        if frag_actions is None:
+            frag_actions = frag_categorical.sample()
+        frag_logprob = frag_categorical.log_prob(frag_actions)
+        frag_entropy = frag_categorical.entropy()
+        
+        action = Action(frag_i=frag_actions,
+                        frag_logprob=frag_logprob,
+                        frag_entropy=frag_entropy)
+        
+        return action
+
+
+    def get_logits(self,
+                   features: torch.Tensor,
+                   fragment_features: torch.Tensor) -> torch.Tensor:
         n_pockets = features.shape[0]
         
         # Apply fragment rotations
@@ -138,25 +176,7 @@ class Agent(nn.Module):
             
         actor_output = actor_output.reshape(n_pockets, self.action_dim)
         
-        masks = torch.repeat_interleave(masks, self.n_rotations, dim=1)
-        
-        # Fragment sampling
-        frag_logits = actor_output
-        if torch.isnan(frag_logits).any():
-            print('NAN logits')
-            import pdb;pdb.set_trace()
-        frag_categorical = CategoricalMasked(logits=frag_logits,
-                                            masks=masks)
-        if frag_actions is None:
-            frag_actions = frag_categorical.sample()
-        frag_logprob = frag_categorical.log_prob(frag_actions)
-        frag_entropy = frag_categorical.entropy()
-        
-        action = Action(frag_i=frag_actions,
-                        frag_logprob=frag_logprob,
-                        frag_entropy=frag_entropy)
-        
-        return action
+        return actor_output
 
 
     def get_value(self, 

@@ -186,14 +186,15 @@ class FragmentBuilderEnv():
         pocket_x = protein_x + ligand_x
         pocket_pos = protein_pos + ligand_pos
         
-        mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
+        # mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
         
-        x = torch.tensor(pocket_x, dtype=torch.long)
+        x = torch.tensor(pocket_x, dtype=torch.float)
         pos = torch.tensor(pocket_pos, dtype=torch.float)
-        mol_id = torch.tensor(mol_id)
+        # mol_id = torch.tensor(mol_id)
         data = Data(x=x,
                     pos=pos,
-                    mol_id=mol_id)
+                    # mol_id=mol_id
+                    )
 
         return data
     
