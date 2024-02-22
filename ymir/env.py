@@ -27,6 +27,7 @@ class FragmentBuilderEnv():
     def __init__(self,
                  protected_fragments: list[Fragment],
                  z_table: AtomicNumberTable,
+                 torsion_angles_deg: list[float] = TORSION_ANGLES_DEG,
                  max_episode_steps: int = 10,
                  valid_action_masks: dict[int, torch.Tensor] = None,
                  embed_hydrogens: bool = EMBED_HYDROGENS,
@@ -36,12 +37,15 @@ class FragmentBuilderEnv():
         self.max_episode_steps = max_episode_steps
         self.valid_action_masks = valid_action_masks
         self.embed_hydrogens = embed_hydrogens
+        self.torsion_angles_deg = torsion_angles_deg
+        
+        self.n_torsions = len(self.torsion_angles_deg)
         
         self.n_fragments = len(self.protected_fragments)
-        self._action_dim = self.n_fragments
+        self._action_dim = self.n_fragments * self.n_torsions
         
         for mask in self.valid_action_masks.values():
-            assert mask.size()[-1] == self.action_dim
+            assert mask.size()[-1] == self.n_fragments
 
         self.seed: Fragment = None
         self.fragment: Fragment = None
@@ -119,7 +123,7 @@ class FragmentBuilderEnv():
         torsion_i = frag_action % self.n_torsions
         torsion_value = self.torsion_angles_deg[torsion_i]
         
-        assert fragment_i < self.action_dim, 'Invalid action'
+        assert fragment_i < self.n_fragments, 'Invalid action'
         protected_fragment = self.protected_fragments[fragment_i]
         
         new_fragment = Fragment(protected_fragment,

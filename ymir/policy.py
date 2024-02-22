@@ -20,8 +20,6 @@ class Action(NamedTuple):
     frag_i: torch.Tensor # (batch_size)
     frag_logprob: torch.Tensor # (batch_size)
     frag_entropy: torch.Tensor # (batch_size)
-    vector: torch.Tensor # (batch_size, 3)
-    vector_logprob: torch.Tensor # (batch_size)
     
 class Agent(nn.Module):
     
@@ -61,13 +59,13 @@ class Agent(nn.Module):
         #                                             max_radius=self.max_radius)
         # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
         
-        self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, 
-                                                                                        -1)).to(self.device)
+        self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
+                                                    requires_grad=False).to(self.device)
         
         # Fragment logit + 3D vector 
         self.actor_irreps = o3.Irreps(f'1x0e')
-        self.actor = o3.FullyConnectedTensorProduct(irreps_in1=self.irreps_pocket_features, 
-                                                    irreps_in2=self.irreps_fragment_features,
+        self.actor = o3.FullyConnectedTensorProduct(irreps_in1=self.irreps_pocket_features[1:], 
+                                                    irreps_in2=self.irreps_fragment_features[1:],
                                                     irreps_out=self.actor_irreps,
                                                     internal_weights=True)
         self.actor.to(self.device)
@@ -98,9 +96,16 @@ class Agent(nn.Module):
         features = self.pocket_feature_extractor(x)
         return features
     
+    
+    def extract_fragment_features(self):
+        fragment_embeddings = torch.einsum('bi,rji->brj', self.fragment_features, self.d_irreps_fragment)
+        fragment_embeddings = fragment_embeddings.reshape(-1, self.irreps_fragment_features.dim) # (n_fragment*n_rotations, irreps_dim)
+        return fragment_embeddings
+    
 
     def get_action(self, 
                    features: torch.Tensor, # (n_pockets, irreps_pocket_features)
+                   fragment_features: torch.Tensor,
                    masks: torch.Tensor = None, # (n_pockets, n_fragments)
                    frag_actions: torch.Tensor = None # (action_dim)
                    ) -> Action:
@@ -108,16 +113,12 @@ class Agent(nn.Module):
         n_pockets = features.shape[0]
         
         # Apply fragment rotations
-        fragment_embeddings = torch.einsum('bi,rji->brj', self.fragment_features, self.d_irreps_fragment)
-        fragment_embeddings = fragment_embeddings.reshape(-1, self.irreps_fragment_features.dim) # (n_fragment*n_rotations, irreps_dim)
-        
         n_fragment_rot = self.action_dim
         # [fragment1rot1, fragment1rot2, fragmentnrotn-1, fragmentnrotn] * n_pocket
         fragment_indices = torch.arange(n_fragment_rot)
         fragment_indices = fragment_indices.repeat(n_pockets)
-        fragment_embeddings = self.fragment_features[fragment_indices]
         
-        import pdb;pdb.set_trace()
+        fragment_embeddings = fragment_features[fragment_indices]
         
         # [pocket1, pocket1, pocket1... pocketn, pocketn, pocketn] with each pocket duplicated n_fragment*n_rot times
         pocket_indices = torch.arange(n_pockets)
@@ -157,8 +158,7 @@ class Agent(nn.Module):
 
     def get_value(self, 
                   features: torch.Tensor) -> torch.Tensor:
-        inv_features, _ = self.split_features(features, irreps=self.irreps_pocket_features)
-        critic_output = self.critic(inv_features)
+        critic_output = self.critic(features)
         value = critic_output
         return value
     
