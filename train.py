@@ -161,7 +161,7 @@ for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_com
         # vina_scores.append(vina_score)
 
 # TO CHANGE/REMOVE
-n_fragments = 500
+n_fragments = 100
 random.shuffle(protected_fragments)
 protected_fragments = protected_fragments[:n_fragments]
 
@@ -230,6 +230,7 @@ agent = Agent(protected_fragments=final_fragments,
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_19_02_2024_23_49_43_500.pt')
 # agent.load_state_dict(state_dict)
 
+agent = agent.to(device)
 fragment_features = agent.extract_fragment_features()
 
 optimizer = Adam(agent.parameters(), lr=lr)
@@ -296,7 +297,7 @@ try:
                 current_frag_actions = current_action.frag_i.cpu()
                 current_frag_logprobs = current_action.frag_logprob.cpu()
                 current_values = agent.get_value(features)
-                current_values = current_values.squeeze(dim=-1)
+                # current_values = current_values.squeeze(dim=-1)
                 
             frag_actions.append(current_frag_actions)
             frag_logprobs.append(current_frag_logprobs)
@@ -453,6 +454,8 @@ try:
                     
                     optimizer.zero_grad()
                     loss.backward()
+                    
+                    # import pdb;pdb.set_trace()
                     
                     nn.utils.clip_grad_value_(parameters=agent.parameters(), 
                                             clip_value=max_grad_value)

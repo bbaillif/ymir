@@ -52,7 +52,7 @@ class Agent(nn.Module):
         self.pocket_feature_extractor = Transformer(irreps_output=self.irreps_pocket_features,
                                                     num_elements=len(self.z_table),
                                                     max_radius=self.max_radius)
-        self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
+        # self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
         
         # self.fragment_feature_extractor = Transformer(irreps_output=self.irreps_fragment_features,
         #                                             num_elements=len(self.z_table),
@@ -60,7 +60,7 @@ class Agent(nn.Module):
         # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
         
         self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
-                                                    requires_grad=False).to(self.device)
+                                                    requires_grad=False)
         
         # Fragment logit + 3D vector 
         self.actor_irreps = o3.Irreps(f'1x0e')
@@ -68,18 +68,20 @@ class Agent(nn.Module):
                                                     irreps_in2=self.irreps_fragment_features[1:],
                                                     irreps_out=self.actor_irreps,
                                                     internal_weights=True)
-        self.actor.to(self.device)
+        # self.actor.to(self.device)
         
         self.critic_irreps = o3.Irreps(f'1x0e')
         self.critic = o3.Linear(irreps_in=self.irreps_pocket_features, 
                                 irreps_out=self.critic_irreps)
-        self.critic.to(self.device)
+        # self.critic.to(self.device)
         
         # Prepare rotation matrix for the fragment features
         self.torsion_angles_rad = torch.deg2rad(torch.tensor(self.torsion_angles_deg))
         self.rot_mats = o3.matrix_x(self.torsion_angles_rad)
         self.d_irreps_fragment = self.irreps_fragment_features.D_from_matrix(self.rot_mats) # (n_angles, irreps_dim, irreps_dim)
-        self.d_irreps_fragment = self.d_irreps_fragment.float().to(self.device)
+        self.d_irreps_fragment = self.d_irreps_fragment.float()
+        self.d_irreps_fragment = torch.nn.Parameter(self.d_irreps_fragment, requires_grad=False)
+        # .to(self.device)
 
 
     def forward(self, 
@@ -131,6 +133,7 @@ class Agent(nn.Module):
         _, pocket_equi_embeddings = self.split_features(pocket_embeddings, irreps=self.irreps_pocket_features)
         _, fragment_equi_embeddings = self.split_features(fragment_embeddings, irreps=self.irreps_fragment_features)
         
+        # actor_output = self.actor(pocket_embeddings, fragment_embeddings)
         actor_output = self.actor(pocket_equi_embeddings, fragment_equi_embeddings)
             
         actor_output = actor_output.reshape(n_pockets, self.action_dim)
@@ -159,7 +162,7 @@ class Agent(nn.Module):
     def get_value(self, 
                   features: torch.Tensor) -> torch.Tensor:
         critic_output = self.critic(features)
-        value = critic_output
+        value = critic_output.squeeze(-1)
         return value
     
     
