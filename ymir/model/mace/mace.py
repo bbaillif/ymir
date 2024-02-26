@@ -183,9 +183,15 @@ class MACE(torch.nn.Module):
         if torch.isnan(node_feats).any():
             import pdb;pdb.set_trace()
 
-        env_vector = scatter_mean(src=node_feats, 
-                                  index=batch.batch, 
-                                  dim=0)
+        # env_vector = scatter_mean(src=node_feats, 
+        #                           index=batch.batch, 
+        #                           dim=0)
+        
+        is_attach_point = x[:, 0] == 1
+        env_vector = node_feats[is_attach_point]
+        
+        n_pockets = batch.batch.max() + 1
+        assert env_vector.shape[0] == n_pockets
 
         # unbatched_contributions = unbatch(node_feats, batch=batch.batch)
         

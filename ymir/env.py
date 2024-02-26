@@ -20,6 +20,7 @@ from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.params import EMBED_HYDROGENS, TORSION_ANGLES_DEG
 from ymir.featurizer_sn import Featurizer
+from ymir.metrics.activity import VinaScore
 
 
 class FragmentBuilderEnv():
@@ -170,8 +171,7 @@ class FragmentBuilderEnv():
     
     
     def _get_info(self):
-        return {'protein_path': self.complex.vina_protein,
-                'seed_i': self.seed_i}
+        return {'protein_path': self.complex.protein_path}
     
     
     def featurize_pocket(self) -> Data:
@@ -205,9 +205,65 @@ class FragmentBuilderEnv():
         self.complex = complx
         self.pocket_mol = Mol(self.complex.pocket.mol)
         fragments = get_fragments_from_mol(self.complex.ligand)
-        self.seed_i = np.random.choice(len(fragments))
-        # self.seed_i = 0
-        self.seed = fragments[self.seed_i]
+        
+        fragments_1ap: list[Fragment] = []
+        for fragment in fragments:
+            aps = fragment.get_attach_points()
+            if len(aps) == 1:
+                fragments_1ap.append(fragment)
+                
+        self.fragment_i = np.random.choice(len(fragments_1ap))
+        self.removed_fragment = fragments_1ap[self.fragment_i]
+        
+        ligand_positions = self.complex.ligand.GetConformer().GetPositions()
+        fragment_positions = self.removed_fragment.GetConformer().GetPositions()
+        fragment_aps = self.removed_fragment.get_attach_points()
+        fragment_ap_idx = list(fragment_aps.keys())[0]
+        fragment_ap_atom = self.removed_fragment.GetAtomWithIdx(fragment_ap_idx)
+        fragment_ap_neighbors = fragment_ap_atom.GetNeighbors()
+        assert len(fragment_ap_neighbors) == 1
+        fragment_neigh_idx = fragment_ap_neighbors[0].GetIdx()
+        
+        from scipy.spatial.distance import cdist
+        distance_matrix = cdist(fragment_positions, ligand_positions)
+        min_dists_idx = distance_matrix.argmin(axis=1)
+        
+        ligand_ap_idx = int(min_dists_idx[fragment_ap_idx])
+        ligand_neigh_idx = int(min_dists_idx[fragment_neigh_idx])
+        
+        brics_bonds = Chem.BRICS.FindBRICSBonds(self.complex.ligand)
+        broken = False
+        for bond in brics_bonds:
+            t_bond, t_labels = bond
+            t1 = (ligand_ap_idx, ligand_neigh_idx)
+            t2 = (ligand_neigh_idx, ligand_ap_idx)
+            if t_bond == t1 or t_bond == t2 :
+                new_mol = Chem.BRICS.BreakBRICSBonds(self.complex.ligand, bonds=[bond])
+                broken = True
+                break
+        if not broken:
+            import pdb;pdb.set_trace()
+        
+        new_frags = Chem.GetMolFrags(new_mol, asMols=True)
+        assert len(new_frags) == 2
+        frag1, frag2 = new_frags
+        if Chem.MolToSmiles(frag1) == Chem.MolToSmiles(self.removed_fragment):
+            self.seed = Fragment(frag2)
+        else:
+            if Chem.MolToSmiles(frag2) != Chem.MolToSmiles(self.removed_fragment):
+                if Chem.MolToSmiles(frag1, isomericSmiles=False) == Chem.MolToSmiles(self.removed_fragment, isomericSmiles=False):
+                    self.seed = Fragment(frag2)
+                else:
+                    if Chem.MolToSmiles(frag2, isomericSmiles=False) != Chem.MolToSmiles(self.removed_fragment, isomericSmiles=False):
+                        import pdb;pdb.set_trace()
+            # assert Chem.MolToSmiles(frag2) == Chem.MolToSmiles(self.removed_fragment)
+                    self.seed = Fragment(frag1)
+            else:
+                self.seed = Fragment(frag1)
+                
+        # import pdb;pdb.set_trace()
+                
+        # self.seed = fragments[self.seed_i]
         
         self.transformations = []
         
@@ -699,7 +755,7 @@ class BatchEnv():
         
     def reset(self,
               complexes: list[Complex],
-              scorer) -> tuple[list[Data], list[dict[str, Any]]]:
+              scorer: VinaScore) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
@@ -761,7 +817,10 @@ class BatchEnv():
                 # scores = env.vina_score.get([mol])
                 scores = self.scorer.get([mol])
                 score = scores[0]
-                reward = -score # we want to maximize the reward, so minimize glide score
+                reward = - score # we want to maximize the reward, so minimize glide score
+                reward = reward * reward # we square the score to give higher importance to high scores
+                if score > 0: # penalize positive vina score
+                    reward = - reward
             else: # construction is ongoing
                 reward = 0
                 

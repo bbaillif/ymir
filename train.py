@@ -38,7 +38,7 @@ logging.basicConfig(filename='train.log',
                     datefmt='%d/%m/%Y %I:%M:%S %p',
                     filemode="w")
 
-seed = 7
+seed = 420
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 random.seed(seed)
 np.random.seed(seed)
@@ -47,11 +47,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 32 # we will have protein envs in parallel
-batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
+n_envs = 64 # we will have protein envs in parallel
+batch_size = min(n_envs, 32) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 5e-4
+lr = 1e-4
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -60,8 +60,8 @@ ent_coef = 0.01
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 1
-use_entropy_loss = True
+n_complexes = 100
+use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -128,7 +128,13 @@ for fragment in protected_fragments:
 protected_fragments = [fragment 
                        for fragment, n in zip(protected_fragments, n_attaches)
                        if n == 1]
-            
+           
+# TO CHANGE/REMOVE
+n_fragments = 100
+random.shuffle(protected_fragments)
+protected_fragments = protected_fragments[:n_fragments]
+protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
+
 protein_paths = []
 for ligand in ligands:
     pdb_id = ligand.GetProp('PDB_ID')
@@ -142,14 +148,21 @@ logging.info('Loading complexes')
 not_working_protein = []
 complexes: list[Complex] = []
 # vina_scores: list[VinaScore] = []
-for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_complexes]), total=n_complexes):
+for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_paths)):
     try:
         complx = Complex(ligand, protein_path)
         fragments = get_fragments_from_mol(ligand)
+        has_frag_1_ap = False
         for fragment in fragments:
             attach_points = fragment.get_attach_points()
             if 7 in attach_points.values():
                 raise Exception("double bond BRICS, we don't include these")
+            if len(attach_points) == 1:
+                frag_smiles = Chem.MolToSmiles(fragment)
+                if frag_smiles in protected_fragments_smiles:
+                    has_frag_1_ap = True
+        if not has_frag_1_ap:
+            raise Exception('We look for fragments with one attach points')
         assert len(fragments) > 1, 'Ligand is not fragmentable (or double bond reaction)'
         vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
         # vina_scorer.set_box_from_ligand(complx.ligand)
@@ -159,12 +172,9 @@ for protein_path, ligand in tqdm(zip(protein_paths[:n_complexes], ligands[:n_com
         not_working_protein.append(protein_path)
     else:
         complexes.append(complx)
+        if len(complexes) == n_complexes:
+            break
         # vina_scores.append(vina_score)
-
-# TO CHANGE/REMOVE
-n_fragments = 500
-random.shuffle(protected_fragments)
-protected_fragments = protected_fragments[:n_fragments]
 
 # Align the attach point ---> neighbor vector to the x axis: (0,0,0) ---> (1,0,0)
 # Then translate such that the neighbor is (0,0,0)
@@ -228,7 +238,7 @@ batch_env = BatchEnv(envs)
 
 agent = Agent(protected_fragments=final_fragments,
               atomic_num_table=z_table)
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_22_02_2024_21_24_07_500.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_24_02_2024_15_27_40_500.pt')
 # agent.load_state_dict(state_dict)
 
 agent = agent.to(device)
