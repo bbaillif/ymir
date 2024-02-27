@@ -24,7 +24,8 @@ class AtomicComENet(AtomisticNN, ComENet) :
         AtomisticNN.__init__(self,
                              readout=readout,
                              features_dim=features_dim)
-        ComENet.__init__(self, out_channels=features_dim)
+        ComENet.__init__(self, out_channels=features_dim,
+                         middle_channels=features_dim)
         self.readout = aggr_resolver(readout)
         
     

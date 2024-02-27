@@ -77,6 +77,9 @@ class AtomisticNNModel():
                                 index=batch.batch, 
                                 dim=0,)
         
+        # is_attach_point = batch.x == 0
+        # env_vector = atomic_contributions[is_attach_point]
+        
         # import pdb;pdb.set_trace()
         
         return env_vector

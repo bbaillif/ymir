@@ -14,15 +14,17 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import Adam
 from torch_geometric.data import Batch, Data
 from e3nn import o3
-from scipy.spatial.transform import Rotation
-from scipy.spatial.distance import euclidean
+
 from ymir.fragment_library import FragmentLibrary
 from ymir.data.structure import Complex
-from ymir.utils.fragment import get_fragments_from_mol
-from ymir.molecule_builder import potential_reactions
+from ymir.utils.fragment import (get_fragments_from_mol, 
+                                 get_seed, 
+                                 center_fragments, 
+                                 get_masks,
+                                 select_mol_with_symbols)
+
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.utils.spatial import (rotate_conformer, 
-                                translate_conformer)
+
 from ymir.env import (FragmentBuilderEnv, 
                             BatchEnv)
 from ymir.policy import Agent, Action
@@ -47,7 +49,7 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 64 # we will have protein envs in parallel
+n_envs = 32 # we will have protein envs in parallel
 batch_size = min(n_envs, 32) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
@@ -56,12 +58,12 @@ gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
 clip_coef = 0.5
-ent_coef = 0.01
+ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 100
-use_entropy_loss = False
+n_complexes = 1
+use_entropy_loss = True
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -78,30 +80,6 @@ ligands = [ligand
            if ligand.GetNumHeavyAtoms() < 50]
 
 random.shuffle(ligands)
-
-def select_mol_with_symbols(mols: list[Union[Mol, Fragment]],
-                            z_list: list[int]):
-    mol_is_included = []
-    for mol in mols:
-        if isinstance(mol, Fragment):
-            frag = Fragment(mol=mol,
-                            protections=mol.protections)
-            frag.unprotect()
-            mol = frag
-        mol = Chem.RemoveHs(mol)
-        included = True
-        for atom in mol.GetAtoms():
-            z = atom.GetAtomicNum()
-            if z not in z_list:
-                included = False
-                break
-        mol_is_included.append(included)
-        
-    out_mols = [mol 
-                for mol, included in zip(mols, mol_is_included)
-                if included]
-    
-    return out_mols
 
 z_list = [0, 6, 7, 8, 16, 17]
 if EMBED_HYDROGENS:
@@ -176,55 +154,16 @@ for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_
             break
         # vina_scores.append(vina_score)
 
-# Align the attach point ---> neighbor vector to the x axis: (0,0,0) ---> (1,0,0)
-# Then translate such that the neighbor is (0,0,0)
-for fragment in protected_fragments:
-    for atom in fragment.GetAtoms():
-        if atom.GetAtomicNum() == 0:
-            attach_point = atom
-            break
-    neighbor = attach_point.GetNeighbors()[0]
-    neighbor_id = neighbor.GetIdx()
-    attach_id = attach_point.GetIdx()
-    positions = fragment.GetConformer().GetPositions()
-    # neighbor_attach = positions[[neighbor_id, attach_id]]
-    # distance = euclidean(neighbor_attach[0], neighbor_attach[1])
-    # x_axis_vector = np.array([[0,0,0], [distance,0,0]])
-    neighbor_pos = positions[neighbor_id]
-    attach_pos = positions[attach_id]
-    attach_neighbor = neighbor_pos - attach_pos
-    distance = euclidean(neighbor_pos, attach_pos)
-    x_axis_vector = np.array([distance, 0, 0])
-    # import pdb;pdb.set_trace()
-    rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=attach_neighbor.reshape(-1, 3))
-    rotate_conformer(conformer=fragment.GetConformer(),
-                        rotation=rotation)
-    
-    positions = fragment.GetConformer().GetPositions()
-    neighbor_pos = positions[neighbor_id]
-    translation = -neighbor_pos
-    translate_conformer(conformer=fragment.GetConformer(),
-                        translation=translation)
+# Get the seed constructions
+seeds = []
+for complx in complexes:
+    seed = get_seed(complx)
+    seeds.append(seed)
 
+center_fragments(protected_fragments)
 final_fragments = protected_fragments
 
-fragment_attach_labels = []
-for act_i, fragment in enumerate(final_fragments):
-    for atom in fragment.GetAtoms():
-        if atom.GetAtomicNum() == 0:
-            attach_label = atom.GetIsotope()
-            break
-    fragment_attach_labels.append(attach_label)
-
-logging.info('Loading valid action masks')
-valid_action_masks: dict[int, list[bool]] = {}
-for attach_label_1, d_potential_attach in potential_reactions.items():
-    mask = [True 
-            if attach_label in d_potential_attach 
-            else False
-            for attach_label in fragment_attach_labels]
-             
-    valid_action_masks[attach_label_1] = torch.tensor(mask, dtype=torch.bool)
+valid_action_masks = get_masks(final_fragments)
 
 logging.info(f'There are {len(final_fragments)} fragments')
 
@@ -234,15 +173,17 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
                                                     valid_action_masks=valid_action_masks,
                                                     embed_hydrogens=EMBED_HYDROGENS)
                                   for _ in range(n_envs)]
-batch_env = BatchEnv(envs)
+state_action = tuple[int, int] # (complx_i, action_i)
+memory: dict[state_action, float] = {}
+batch_env = BatchEnv(envs,
+                     memory)
 
 agent = Agent(protected_fragments=final_fragments,
               atomic_num_table=z_table)
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_24_02_2024_15_27_40_500.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_27_02_2024_01_17_44_5000.pt')
 # agent.load_state_dict(state_dict)
 
 agent = agent.to(device)
-fragment_features = agent.extract_fragment_features()
 
 optimizer = Adam(agent.parameters(), lr=lr)
 
@@ -259,6 +200,7 @@ try:
         
         complx_i = episode_i % n_complexes
         current_complexes = [complexes[complx_i]] * n_envs
+        current_seeds = [seeds[complx_i]] * n_envs
         # vina_score = vina_scores[complx_i]
         
         complx = current_complexes[0]
@@ -267,7 +209,9 @@ try:
         vina_score = VinaScore(vina_scorer=vina_scorer)
         
         next_info = batch_env.reset(current_complexes,
-                                    vina_score)
+                                    current_seeds,
+                                    vina_score,
+                                    complx_i)
         next_terminated = [False] * n_envs
         
         # each first dimension of list is the number of total steps
@@ -302,7 +246,6 @@ try:
                 features = agent.extract_features(x)
                 current_masks = current_masks.to(device)
                 current_action: Action = agent.get_action(features,
-                                                          fragment_features,
                                                             masks=current_masks)
                 current_frag_actions = current_action.frag_i.cpu()
                 current_frag_logprobs = current_action.frag_logprob.cpu()
@@ -426,7 +369,6 @@ try:
                     current_masks = mb_masks.to(device)
                     current_frag_actions = mb_frag_actions.to(device)
                     current_action = agent.get_action(features=features,
-                                                      fragment_features=fragment_features,
                                                         masks=current_masks,
                                                         frag_actions=current_frag_actions)
                     
@@ -471,8 +413,8 @@ try:
                     nn.utils.clip_grad_value_(parameters=agent.parameters(), 
                                             clip_value=max_grad_value)
                     optimizer.step()
-                    
-                    fragment_features = agent.extract_fragment_features()
+        
+        import pdb;pdb.set_trace()
         
         logging.info(f'Second loop time: {time.time() - start_time}')
                 

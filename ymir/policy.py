@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Batch
 from e3nn import o3
-from ymir.model import MACE
+from ymir.model import ComENetModel
 from ymir.distribution import CategoricalMasked
 from typing import NamedTuple, Sequence
 from ymir.params import (EMBED_HYDROGENS, 
@@ -11,7 +11,9 @@ from ymir.params import (EMBED_HYDROGENS,
                          MAX_RADIUS,
                          TORSION_ANGLES_DEG,
                          HIDDEN_IRREPS,
-                         IRREPS_FRAGMENTS)
+                         IRREPS_FRAGMENTS,
+                         COMENET_CONFIG,
+                         FEATURES_DIM)
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
 from ymir.featurizer_sn import Featurizer
@@ -22,78 +24,74 @@ class Action(NamedTuple):
     frag_logprob: torch.Tensor # (batch_size)
     frag_entropy: torch.Tensor # (batch_size)
     
+    
+class MultiLinear(nn.Module):
+    
+    def __init__(self, 
+                 input_dim: int,
+                 hidden_dims: list[int],
+                 output_dim: int,
+                 *args, 
+                 **kwargs) -> None:
+        super().__init__(*args, 
+                         **kwargs)
+        assert len(hidden_dims) > 0
+        dims = [input_dim] + hidden_dims
+        modules = []
+        first_hidden = True
+        for dim1, dim2 in zip(dims, dims[1:]):
+            modules.append(nn.Linear(dim1, dim2))
+            if first_hidden:
+                modules.append(nn.Tanh())
+                first_hidden = False
+            else:
+                modules.append(nn.SiLU())
+        modules.append(nn.Linear(dims[-1], output_dim))
+
+        self.sequential = nn.Sequential(*modules)
+        
+    def forward(self,
+                x: torch.Tensor):
+        return self.sequential(x)
+    
+    
 class Agent(nn.Module):
     
     def __init__(self, 
                  protected_fragments: list[Fragment],
                  atomic_num_table: AtomicNumberTable,
-                 irreps_pocket_features: o3.Irreps = HIDDEN_IRREPS,
-                 irreps_fragment_features: o3.Irreps = IRREPS_FRAGMENTS,
+                 features_dim: int = FEATURES_DIM,
                  lmax: int = LMAX,
                  max_radius: float = MAX_RADIUS,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
-                 torsion_angles_deg: Sequence[float] = TORSION_ANGLES_DEG,
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
         self.z_table = atomic_num_table
-        self.irreps_pocket_features = irreps_pocket_features
-        self.irreps_fragment_features = irreps_fragment_features
+        self.features_dim = features_dim
         self.lmax = lmax
         self.max_radius = max_radius
         self.device = device
         self.embed_hydrogens = embed_hydrogens
-        self.torsion_angles_deg = torsion_angles_deg
         
-        self.n_rotations = len(self.torsion_angles_deg)
         self.n_fragments = len(self.protected_fragments)
-        self.action_dim = self.n_fragments * self.n_rotations
+        self.action_dim = self.n_fragments
         
-        self.pocket_feature_extractor = MACE(hidden_irreps=self.irreps_pocket_features,
-                                            num_elements=len(self.z_table))
-        # self.pocket_feature_extractor = self.pocket_feature_extractor.to(self.device)
-        
-        # self.fragment_feature_extractor = self.pocket_feature_extractor
-        self.irreps_fragment_features = self.irreps_pocket_features
-        
-        self.fragment_feature_extractor = MACE(hidden_irreps=self.irreps_fragment_features,
-                                                num_elements=len(self.z_table))
-        # self.fragment_feature_extractor = self.fragment_feature_extractor.to(self.device)
-        
-        self.fragment_features = torch.nn.Parameter(self.irreps_fragment_features.randn(self.n_fragments, -1),
-                                                    requires_grad=True)
-        # self.featurizer = Featurizer(z_table=self.z_table)
-        # center_pos = [0,0,0]
-        # data_list = []
-        # for fragment in self.protected_fragments:
-        #     x, pos = self.featurizer.get_fragment_features(fragment, center_pos)
-        #     data = Data(x=torch.tensor(x, dtype=torch.float),
-        #                 pos=torch.tensor(pos, dtype=torch.float))
-        #     data_list.append(data)
-        # self.fragment_features = Batch.from_data_list(data_list)
-        # self.fragment_features = self.fragment_features.to(self.device)
+        self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
+                                                     features_dim=self.features_dim,
+                                                     readout='mean')
         
         # Fragment logit + 3D vector 
-        self.actor_irreps = o3.Irreps(f'1x0e')
-        self.actor = o3.FullyConnectedTensorProduct(irreps_in1=self.irreps_pocket_features[1:], 
-                                                    irreps_in2=self.irreps_fragment_features[1:],
-                                                    irreps_out=self.actor_irreps,
-                                                    internal_weights=True)
-        # self.actor.to(self.device)
+        hidden_dims = [self.features_dim, 
+                       self.features_dim // 2]
+        self.actor = MultiLinear(input_dim=self.features_dim, 
+                                 hidden_dims=hidden_dims,
+                                 output_dim=self.action_dim)
         
-        self.critic_irreps = o3.Irreps(f'1x0e')
-        self.critic = o3.Linear(irreps_in=self.irreps_pocket_features, 
-                                irreps_out=self.critic_irreps)
-        # self.critic.to(self.device)
-        
-        # Prepare rotation matrix for the fragment features
-        self.torsion_angles_rad = torch.deg2rad(torch.tensor(self.torsion_angles_deg))
-        self.rot_mats = o3.matrix_x(self.torsion_angles_rad)
-        self.d_irreps_fragment = self.irreps_fragment_features.D_from_matrix(self.rot_mats) # (n_angles, irreps_dim, irreps_dim)
-        self.d_irreps_fragment = self.d_irreps_fragment.float()
-        self.d_irreps_fragment = torch.nn.Parameter(self.d_irreps_fragment, requires_grad=False)
-        # .to(self.device)
+        self.critic = MultiLinear(input_dim=self.features_dim, 
+                                 hidden_dims=hidden_dims,
+                                 output_dim=1)
 
 
     def forward(self, 
@@ -110,41 +108,14 @@ class Agent(nn.Module):
         features = self.pocket_feature_extractor(x)
         return features
     
-    
-    def extract_fragment_features(self):
-        # fragment_features = self.fragment_feature_extractor(self.fragment_features)
-        fragment_features = self.fragment_features
-        slices = self.irreps_fragment_features.slices()
-        assert len(slices) == 2, 'Only works on nx0e + nx1o'
-        equi_slice_start = slices[1].start
-        equi_slice_stop = slices[1].stop
-        x_features_idx = range(equi_slice_start, equi_slice_stop, 3)
-        mask = torch.ones_like(fragment_features)
-        mask[:, x_features_idx] = 0
-        fragment_features = fragment_features * mask
-        # import pdb;pdb.set_trace()
-        # fragment_embeddings = torch.einsum('bi,rji->brj', self.fragment_features, self.d_irreps_fragment)
-        fragment_embeddings = torch.einsum('bi,rji->brj', fragment_features, self.d_irreps_fragment)
-        fragment_embeddings = fragment_embeddings.reshape(-1, self.irreps_fragment_features.dim) # (n_fragment*n_rotations, irreps_dim)
-        return fragment_embeddings
-    
 
     def get_action(self, 
                    features: torch.Tensor, # (n_pockets, irreps_pocket_features)
-                   fragment_features: torch.Tensor,
                    masks: torch.Tensor = None, # (n_pockets, n_fragments)
                    frag_actions: torch.Tensor = None # (action_dim)
                    ) -> Action:
             
-        frag_logits = self.get_logits(features, fragment_features)
-        
-        # frag_logits = frag_logits.clamp(min=-5, max=5)
-        # Solution 2: normalize logits with -mean / std
-        # Solution 3: normalize logits with norm
-        
-        # import pdb;pdb.set_trace()
-        
-        masks = torch.repeat_interleave(masks, self.n_rotations, dim=1)
+        frag_logits = self.actor(features)
         
         # Fragment sampling
         if torch.isnan(frag_logits).any():
@@ -162,39 +133,6 @@ class Agent(nn.Module):
                         frag_entropy=frag_entropy)
         
         return action
-
-
-    def get_logits(self,
-                   features: torch.Tensor,
-                   fragment_features: torch.Tensor) -> torch.Tensor:
-        
-        n_pockets = features.shape[0]
-        
-        # Apply fragment rotations
-        n_fragment_rot = self.action_dim
-        # [fragment1rot1, fragment1rot2, fragmentnrotn-1, fragmentnrotn] * n_pocket
-        fragment_indices = torch.arange(n_fragment_rot)
-        fragment_indices = fragment_indices.repeat(n_pockets)
-        
-        fragment_embeddings = fragment_features[fragment_indices]
-        
-        # [pocket1, pocket1, pocket1... pocketn, pocketn, pocketn] with each pocket duplicated n_fragment*n_rot times
-        pocket_indices = torch.arange(n_pockets)
-        pocket_indices = torch.repeat_interleave(pocket_indices, n_fragment_rot)
-        pocket_embeddings = features[pocket_indices] # (n_pocket*n_rotations*self.n_fragments, irreps_dim)
-        
-        # Embedding dimension is
-        # Pocket0Frag0Rot0, Pocket0Frag0Rot1, ... Pocket0Frag1Rot0, Pocket0Frag1Rot1... PocketnFragnRotn-1, PocketnFragnRotn
-        
-        _, pocket_equi_embeddings = self.split_features(pocket_embeddings, irreps=self.irreps_pocket_features)
-        _, fragment_equi_embeddings = self.split_features(fragment_embeddings, irreps=self.irreps_fragment_features)
-        
-        # actor_output = self.actor(pocket_embeddings, fragment_embeddings)
-        actor_output = self.actor(pocket_equi_embeddings, fragment_equi_embeddings)
-            
-        actor_output = actor_output.reshape(n_pockets, self.action_dim)
-        
-        return actor_output
 
 
     def get_value(self, 

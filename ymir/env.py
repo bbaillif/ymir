@@ -43,7 +43,7 @@ class FragmentBuilderEnv():
         self.n_torsions = len(self.torsion_angles_deg)
         
         self.n_fragments = len(self.protected_fragments)
-        self._action_dim = self.n_fragments * self.n_torsions
+        self._action_dim = self.n_fragments
         
         for mask in self.valid_action_masks.values():
             assert mask.size()[-1] == self.n_fragments
@@ -100,8 +100,8 @@ class FragmentBuilderEnv():
         self.transformations.append(rotation)
         self.transformations.append(translation)
         
-        Chem.MolToMolFile(self.seed, 'seed_after.mol')
-        Chem.MolToMolFile(self.pocket_mol, 'pocket_after.mol')
+        # Chem.MolToMolFile(self.seed, 'seed_after.mol')
+        # Chem.MolToMolFile(self.pocket_mol, 'pocket_after.mol')
         
         
     def get_seed_fragment_distance(self,
@@ -113,27 +113,21 @@ class FragmentBuilderEnv():
         return 1.45 # hard coded but should be modified
         
         
-    def get_new_fragment(self,
-                        frag_action: int):
+    def get_new_fragments(self,
+                        frag_action: int) -> list[Fragment]:
         
-        fragment_i = frag_action // self.n_torsions
-        try:
-            protected_fragment = self.protected_fragments[fragment_i]
-        except:
-            import pdb;pdb.set_trace()
-        torsion_i = frag_action % self.n_torsions
-        torsion_value = self.torsion_angles_deg[torsion_i]
-        
-        assert fragment_i < self.n_fragments, 'Invalid action'
+        fragment_i = frag_action
         protected_fragment = self.protected_fragments[fragment_i]
         
-        new_fragment = Fragment(protected_fragment,
-                                protections=protected_fragment.protections)
+        new_fragments = []
+        for torsion_value in self.torsion_angles_deg:
+            new_fragment = Fragment(protected_fragment,
+                                    protections=protected_fragment.protections)
+            rotation = Rotation.from_euler('x', torsion_value)
+            rotate_conformer(new_fragment.GetConformer(), rotation)
+            new_fragments.append(new_fragment)
         
-        rotation = Rotation.from_euler('x', torsion_value)
-        rotate_conformer(new_fragment.GetConformer(), rotation)
-        
-        return new_fragment
+        return new_fragments
         
         
     def translate_seed(self,
@@ -153,15 +147,42 @@ class FragmentBuilderEnv():
         
         
     def action_to_fragment_build(self,
-                                 frag_action: int):
+                                 frag_action: int) -> float:
         
-        new_fragment = self.get_new_fragment(frag_action)
-        self.translate_seed(fragment=new_fragment)
+        new_fragments = self.get_new_fragments(frag_action)
+        self.translate_seed(fragment=None)
         
-        product = add_fragment_to_seed(seed=self.seed,
-                                        fragment=new_fragment)
-        
-        self.seed = product
+        state_action_t = (self.complx_i, frag_action)
+        if state_action_t in self.memory: # we know what it does, so no need to recompute
+            reward = self.memory[state_action_t]
+            new_fragment = new_fragments[0]
+            product = add_fragment_to_seed(seed=self.seed,
+                                            fragment=new_fragment)
+            self.seed = product
+        else:
+            products = []
+            for new_fragment in new_fragments:
+                product = add_fragment_to_seed(seed=self.seed,
+                                                fragment=new_fragment)
+                products.append(product)
+            
+            mols_to_score = []
+            for product in products:
+                has_clash = self.get_pocket_ligand_clash(product)
+                if not has_clash:
+                    mols_to_score.append(self.get_clean_mol(product))
+                
+            if len(mols_to_score) > 0:
+                scores = self.scorer.get(mols_to_score)
+                max_i = np.argmin(scores)
+                reward = - scores[max_i] # minus to have a positive reward, maximize reward
+                self.seed = products[max_i]
+            else:
+                reward = -10.0 # Default reward, there is a clash
+                self.seed = products[0] # Default molecule is the first one
+            self.memory[state_action_t] = reward
+            
+        return reward
         
     
     def _get_obs(self):
@@ -171,7 +192,7 @@ class FragmentBuilderEnv():
     
     
     def _get_info(self):
-        return {'protein_path': self.complex.protein_path}
+        return {}
     
     
     def featurize_pocket(self) -> Data:
@@ -200,70 +221,20 @@ class FragmentBuilderEnv():
     
     
     def reset(self, 
-              complx: Complex) -> tuple[Data, dict[str, Any]]:
+              complx: Complex,
+              seed: Fragment,
+              scorer: VinaScore,
+              complx_i: int,
+              memory: dict) -> tuple[Data, dict[str, Any]]:
         
         self.complex = complx
+        self.seed = Fragment(seed,
+                             protections=seed.protections)
+        self.scorer = scorer
+        self.complx_i = complx_i
+        self.memory = memory
+        
         self.pocket_mol = Mol(self.complex.pocket.mol)
-        fragments = get_fragments_from_mol(self.complex.ligand)
-        
-        fragments_1ap: list[Fragment] = []
-        for fragment in fragments:
-            aps = fragment.get_attach_points()
-            if len(aps) == 1:
-                fragments_1ap.append(fragment)
-                
-        self.fragment_i = np.random.choice(len(fragments_1ap))
-        self.removed_fragment = fragments_1ap[self.fragment_i]
-        
-        ligand_positions = self.complex.ligand.GetConformer().GetPositions()
-        fragment_positions = self.removed_fragment.GetConformer().GetPositions()
-        fragment_aps = self.removed_fragment.get_attach_points()
-        fragment_ap_idx = list(fragment_aps.keys())[0]
-        fragment_ap_atom = self.removed_fragment.GetAtomWithIdx(fragment_ap_idx)
-        fragment_ap_neighbors = fragment_ap_atom.GetNeighbors()
-        assert len(fragment_ap_neighbors) == 1
-        fragment_neigh_idx = fragment_ap_neighbors[0].GetIdx()
-        
-        from scipy.spatial.distance import cdist
-        distance_matrix = cdist(fragment_positions, ligand_positions)
-        min_dists_idx = distance_matrix.argmin(axis=1)
-        
-        ligand_ap_idx = int(min_dists_idx[fragment_ap_idx])
-        ligand_neigh_idx = int(min_dists_idx[fragment_neigh_idx])
-        
-        brics_bonds = Chem.BRICS.FindBRICSBonds(self.complex.ligand)
-        broken = False
-        for bond in brics_bonds:
-            t_bond, t_labels = bond
-            t1 = (ligand_ap_idx, ligand_neigh_idx)
-            t2 = (ligand_neigh_idx, ligand_ap_idx)
-            if t_bond == t1 or t_bond == t2 :
-                new_mol = Chem.BRICS.BreakBRICSBonds(self.complex.ligand, bonds=[bond])
-                broken = True
-                break
-        if not broken:
-            import pdb;pdb.set_trace()
-        
-        new_frags = Chem.GetMolFrags(new_mol, asMols=True)
-        assert len(new_frags) == 2
-        frag1, frag2 = new_frags
-        if Chem.MolToSmiles(frag1) == Chem.MolToSmiles(self.removed_fragment):
-            self.seed = Fragment(frag2)
-        else:
-            if Chem.MolToSmiles(frag2) != Chem.MolToSmiles(self.removed_fragment):
-                if Chem.MolToSmiles(frag1, isomericSmiles=False) == Chem.MolToSmiles(self.removed_fragment, isomericSmiles=False):
-                    self.seed = Fragment(frag2)
-                else:
-                    if Chem.MolToSmiles(frag2, isomericSmiles=False) != Chem.MolToSmiles(self.removed_fragment, isomericSmiles=False):
-                        import pdb;pdb.set_trace()
-            # assert Chem.MolToSmiles(frag2) == Chem.MolToSmiles(self.removed_fragment)
-                    self.seed = Fragment(frag1)
-            else:
-                self.seed = Fragment(frag1)
-                
-        # import pdb;pdb.set_trace()
-                
-        # self.seed = fragments[self.seed_i]
         
         self.transformations = []
         
@@ -319,11 +290,14 @@ class FragmentBuilderEnv():
         self.actions.append(frag_action)
         n_actions = len(self.actions)
         
-        self.action_to_fragment_build(frag_action) # seed is deprotected
+        reward = self.action_to_fragment_build(frag_action) # seed is deprotected
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
-        reward = 0 # reward is handled in batch, once all envs are done
+        # REMOVE FOR MULTI-STEP RL
+        if not self.terminated:
+            import pdb;pdb.set_trace()
+        assert self.terminated, 'Something is wrong with the fragmentation code'
         
         if n_actions == self.max_episode_steps: # not terminated but reaching max step size
             self.truncated = True
@@ -573,7 +547,8 @@ class FragmentBuilderEnv():
         return all_has_clashes
     
     
-    def get_pocket_seed_clash(self):
+    def get_pocket_ligand_clash(self,
+                              ligand: Mol):
         
         vdw_distances = defaultdict(dict)
         def get_vdw_min_distance(symbol1, symbol2):
@@ -594,11 +569,11 @@ class FragmentBuilderEnv():
         
         #### Pocket - Seed clashes
         
-        ps = Chem.CombineMols(self.pocket_mol, self.seed)
+        ps = Chem.CombineMols(self.pocket_mol, ligand)
         atoms = [atom for atom in ps.GetAtoms()]
         n_pocket_atoms = self.pocket_mol.GetNumAtoms()
         pocket_atoms = atoms[:n_pocket_atoms]
-        seed_atoms = atoms[n_pocket_atoms:]
+        ligand_atoms = atoms[n_pocket_atoms:]
         distance_matrix = Chem.Get3DDistanceMatrix(mol=ps)
         ps_distance_matrix = distance_matrix[:n_pocket_atoms, n_pocket_atoms:]
         
@@ -619,7 +594,7 @@ class FragmentBuilderEnv():
         has_clash = False
     
         for idx1, atom1 in enumerate(pocket_atoms):
-            for idx2, atom2 in enumerate(seed_atoms):
+            for idx2, atom2 in enumerate(ligand_atoms):
                 
                 symbol1 = atom1.GetSymbol()
                 symbol2 = atom2.GetSymbol()
@@ -655,26 +630,26 @@ class FragmentBuilderEnv():
             
             # import pdb;pdb.set_trace()
 
-            bonds = self.geometry_extractor.get_bonds(self.seed)
+            bonds = self.geometry_extractor.get_bonds(ligand)
             bond_idxs = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
                         for bond in bonds]
             bond_idxs = [t 
                         if t[0] < t[1] 
                         else (t[1], t[0])
                         for t in bond_idxs ]
-            angle_idxs = self.geometry_extractor.get_angles_atom_ids(self.seed)
+            angle_idxs = self.geometry_extractor.get_angles_atom_ids(ligand)
             two_hop_idxs = [(t[0], t[2])
                                     if t[0] < t[2]
                                     else (t[2], t[0])
                                     for t in angle_idxs]
-            torsion_idxs = self.geometry_extractor.get_torsions_atom_ids(self.seed)
+            torsion_idxs = self.geometry_extractor.get_torsions_atom_ids(ligand)
             three_hop_idxs = [(t[0], t[3])
                                 if t[0] < t[3]
                                 else (t[3], t[0])
                                 for t in torsion_idxs]
 
-            for idx1, atom1 in enumerate(seed_atoms):
-                for idx2, atom2 in enumerate(seed_atoms[idx1+1:]):
+            for idx1, atom1 in enumerate(ligand_atoms):
+                for idx2, atom2 in enumerate(ligand_atoms[idx1+1:]):
                     idx2 = idx2 + idx1 + 1
                     not_bond = (idx1, idx2) not in bond_idxs
                     not_angle = (idx1, idx2) not in two_hop_idxs
@@ -710,8 +685,9 @@ class FragmentBuilderEnv():
                     
         return has_clash
     
-    def get_clean_mol(self):
-        frag = Fragment(self.seed)
+    def get_clean_mol(self,
+                      ligand: Mol):
+        frag = Fragment(ligand)
         frag.protect()
         Chem.SanitizeMol(frag)
         mol = Chem.RemoveHs(frag)
@@ -749,30 +725,29 @@ class FragmentBuilderEnv():
 class BatchEnv():
     
     def __init__(self,
-                 envs: list[FragmentBuilderEnv]) -> None:
+                 envs: list[FragmentBuilderEnv],
+                 memory: dict) -> None:
         self.envs = envs
+        self.memory = memory
         
         
     def reset(self,
               complexes: list[Complex],
-              scorer: VinaScore) -> tuple[list[Data], list[dict[str, Any]]]:
+              seeds: list[Fragment],
+              scorer: VinaScore,
+              complx_i: int) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
-        for env, complx in zip(self.envs, complexes):
-            # obs, info = env.reset(complx)
-            info = env.reset(complx)
-            # batch_obs.append(obs)
+        for env, seed, complx in zip(self.envs, seeds, complexes):
+            info = env.reset(complx,
+                             seed,
+                             scorer,
+                             complx_i,
+                             self.memory)
             batch_info.append(info)
-        # batch_obs = Batch.from_data_list(batch_obs)
-        # return batch_obs, batch_info
         self.terminateds = [False] * len(self.envs)
         self.ongoing_env_idxs = list(range(len(self.envs)))
-        
-        # Chem.MolToMolFile(complexes[0].pocket.mol, 'original_pocket.mol')
-        
-        self.scorer = scorer
-        # self.reward_function = DockingBatchRewards(complx, scorer)
         
         return batch_info
     
@@ -807,10 +782,10 @@ class BatchEnv():
         for env_i in self.ongoing_env_idxs:
             env = self.envs[env_i]
             terminated = self.terminateds[env_i]
-            mol = env.get_clean_mol()
+            mol = env.get_clean_mol(env.seed)
             # n_clashes = env.complex.clash_detector.get([mol])
             # n_clash = n_clashes[0]
-            has_clash = env.get_pocket_seed_clash()
+            has_clash = env.get_pocket_ligand_clash(ligand=env.seed)
             if has_clash: # we penalize clash
                 reward = clash_penalty
             elif terminated: # if no clash, we score the ligand is construction is finished
@@ -845,19 +820,20 @@ class BatchEnv():
         batch_truncated = []
         batch_info = []
         mols = []
+        batch_rewards = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
-            _, terminated, truncated, info = env.step(frag_action)
+            frag_action = int(frag_action)
+            reward, terminated, truncated, info = env.step(frag_action)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
             
+            batch_rewards.append(reward)
             batch_truncated.append(truncated)
             batch_info.append(info)
             
-            mols.append(env.get_clean_mol())
-            
-        batch_rewards = self.get_rewards()
+            mols.append(env.get_clean_mol(env.seed))
         
         for i, (reward, truncated) in enumerate(zip(batch_rewards, batch_truncated)):
             if truncated:
@@ -873,7 +849,7 @@ class BatchEnv():
                                  if not terminated]
         logging.debug(self.ongoing_env_idxs)
         logging.debug(self.terminateds)
-            
+        
         # batch_obs = Batch.from_data_list(batch_obs)
         # return batch_obs, batch_reward, batch_terminated, batch_truncated, batch_info
         return batch_rewards, list(self.terminateds), batch_truncated, batch_info
@@ -883,7 +859,7 @@ class BatchEnv():
         
         mols = []
         for env in self.envs:
-            mol_h = env.get_clean_mol()
+            mol_h = env.get_clean_mol(env.seed)
             mols.append(mol_h)
         return mols
             
@@ -907,7 +883,7 @@ class BatchEnv():
         save_path = 'ligands.sdf' 
         with Chem.SDWriter(save_path) as ligand_writer:
             for env in self.envs:
-                mol_h = env.get_clean_mol()
+                mol_h = env.get_clean_mol(env.seed)
                 ligand_writer.write(mol_h)
               
         pocket_path = 'pockets.sdf'  
