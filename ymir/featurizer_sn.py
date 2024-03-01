@@ -5,7 +5,7 @@ from ymir.atomic_num_table import (AtomicNumberTable,
                                    to_one_hot)
 from torch_geometric.data import Data
 from rdkit.Chem import Mol
-from ymir.params import MAX_RADIUS
+from ymir.params import POCKET_RADIUS
 from ymir.data import Fragment
 
 xyz_coordinate = list[float, float, float]
@@ -20,7 +20,7 @@ class Featurizer():
                          mol: Mol,
                         center_pos: tuple[float, float, float] = None,
                         embed_hydrogens: bool = False,
-                        max_radius: float = MAX_RADIUS,
+                        max_radius: float = POCKET_RADIUS,
                         ) -> tuple[list[int], list[float]]:
         mol_positions = mol.GetConformer().GetPositions()
         x = []
@@ -37,10 +37,10 @@ class Featurizer():
             if embed:
                 if atomic_num in self.z_table.zs:
                     idx = self.z_table.z_to_index(atomic_num)
+                    x.append(idx)
                     # one_hot = [0.0] * len(self.z_table)
                     # one_hot[idx] = 1.0
                     # x.append(one_hot)
-                    x.append(idx)
                     pos.append(atom_pos.tolist())
         
         return x, pos
@@ -49,7 +49,7 @@ class Featurizer():
                               fragment: Fragment,
                             center_pos: tuple[float, float, float] = None,
                             embed_hydrogens: bool = False,
-                            max_radius: float = MAX_RADIUS,):
+                            max_radius: float = POCKET_RADIUS,):
         
         frag_copy = Fragment(fragment,
                             protections=fragment.protections)

@@ -12,6 +12,8 @@ from ymir.utils.mol_conversion import (rdkit_conf_to_ccdc_mol,
 from rdkit.Chem.rdMolDescriptors import CalcNumRotatableBonds
 from rdkit.Chem.Descriptors import MolWt
 from ccdc.conformer import ConformerGenerator
+from scipy.spatial.transform import Rotation
+from ymir.utils.spatial import rotate_conformer, translate_conformer
 
 
 class FragmentLibrary():
@@ -19,10 +21,15 @@ class FragmentLibrary():
     def __init__(self,
                  ligands: list[Mol] = None,
                  fragments: list[Fragment] = None,
-                 removeHs: bool = True) -> None:
+                 removeHs: bool = True,
+                 subset: str = 'refined') -> None:
         self.pdbbind = PDBbind()
-        self.pdbbind_ligand_path = '/home/bb596/hdd/ymir/pdbbind_ligands.sdf'
-        self.fragments_path = '/home/bb596/hdd/ymir/small_fragments_3D.sdf' 
+        assert subset in ['all', 'refined', 'general'], \
+            'Select one PDBbind subset among all, refined or general'
+        self.subset = subset
+            
+        self.pdbbind_ligand_path = f'/home/bb596/hdd/ymir/pdbbind_ligands_{self.subset}.sdf'
+        self.fragments_path = f'/home/bb596/hdd/ymir/small_fragments_3D_{self.subset}.sdf' 
         self.removeHs = removeHs
         
         self._ligands = ligands # Default are PDBbind ligands, when ligands is None
@@ -61,8 +68,8 @@ class FragmentLibrary():
     
     
     def write_pdbbind_ligands(self) -> None:
-        ligands = self.pdbbind.get_ligands()
-        with Chem.SDWriter('/home/bb596/hdd/ymir/pdbbind_ligands.sdf') as writer:
+        ligands = self.pdbbind.get_ligands(subset=self.subset)
+        with Chem.SDWriter(self.pdbbind_ligand_path) as writer:
             for mol in ligands:
                 # Set PDB ID as molecule name, there is a unique ligand for each PDB ID in PDBbind
                 pdb_id = mol.GetConformer().GetProp('PDB_ID')
@@ -141,4 +148,3 @@ class FragmentLibrary():
         
         return protected_fragments
                 
-        

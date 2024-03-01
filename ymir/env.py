@@ -5,7 +5,7 @@ import logging
 from rdkit import Chem
 from rdkit.Chem import Mol
 from ymir.molecule_builder import add_fragment_to_seed
-from ymir.utils.fragment import get_fragments_from_mol
+from ymir.utils.fragment import get_fragments_from_mol, get_neighbor_symbol
 from ymir.data.structure.complex import Complex
 from torch_geometric.data import Data
 from ymir.data import Fragment
@@ -18,9 +18,10 @@ from tqdm import tqdm
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.params import EMBED_HYDROGENS, TORSION_ANGLES_DEG
+from ymir.params import EMBED_HYDROGENS
 from ymir.featurizer_sn import Featurizer
 from ymir.metrics.activity import VinaScore
+from ymir.bond_distance import MedianBondDistance
 
 
 class FragmentBuilderEnv():
@@ -28,7 +29,6 @@ class FragmentBuilderEnv():
     def __init__(self,
                  protected_fragments: list[Fragment],
                  z_table: AtomicNumberTable,
-                 torsion_angles_deg: list[float] = TORSION_ANGLES_DEG,
                  max_episode_steps: int = 10,
                  valid_action_masks: dict[int, torch.Tensor] = None,
                  embed_hydrogens: bool = EMBED_HYDROGENS,
@@ -38,9 +38,6 @@ class FragmentBuilderEnv():
         self.max_episode_steps = max_episode_steps
         self.valid_action_masks = valid_action_masks
         self.embed_hydrogens = embed_hydrogens
-        self.torsion_angles_deg = torsion_angles_deg
-        
-        self.n_torsions = len(self.torsion_angles_deg)
         
         self.n_fragments = len(self.protected_fragments)
         self._action_dim = self.n_fragments
@@ -53,6 +50,7 @@ class FragmentBuilderEnv():
         
         self.geometry_extractor = GeometryExtractor()
         self.featurizer = Featurizer(z_table=self.z_table)
+        self.mbd = MedianBondDistance()
         
     @property
     def action_dim(self) -> int:
@@ -110,7 +108,10 @@ class FragmentBuilderEnv():
         # Get Seed attach neighbor (which is the fragment attach point)
         # Compute the ideal length between the two atoms
         
-        return 1.45 # hard coded but should be modified
+        construct_neighbor_symbol = get_neighbor_symbol(self.seed)
+        fragment_neighbor_symbol = get_neighbor_symbol(fragment)
+        distance = self.mbd.get_mbd(construct_neighbor_symbol, fragment_neighbor_symbol)
+        return distance # hard coded but should be modified
         
         
     def get_new_fragments(self,
@@ -119,13 +120,7 @@ class FragmentBuilderEnv():
         fragment_i = frag_action
         protected_fragment = self.protected_fragments[fragment_i]
         
-        new_fragments = []
-        for torsion_value in self.torsion_angles_deg:
-            new_fragment = Fragment(protected_fragment,
-                                    protections=protected_fragment.protections)
-            rotation = Rotation.from_euler('x', torsion_value)
-            rotate_conformer(new_fragment.GetConformer(), rotation)
-            new_fragments.append(new_fragment)
+        new_fragments = [protected_fragment]
         
         return new_fragments
         
@@ -150,37 +145,50 @@ class FragmentBuilderEnv():
                                  frag_action: int) -> float:
         
         new_fragments = self.get_new_fragments(frag_action)
-        self.translate_seed(fragment=None)
+        self.translate_seed(fragment=new_fragments[0])
         
-        state_action_t = (self.complx_i, frag_action)
+        state_action_t = (self.seed_i, frag_action)
         if state_action_t in self.memory: # we know what it does, so no need to recompute
             reward = self.memory[state_action_t]
             new_fragment = new_fragments[0]
             product = add_fragment_to_seed(seed=self.seed,
                                             fragment=new_fragment)
-            self.seed = product
         else:
-            products = []
-            for new_fragment in new_fragments:
-                product = add_fragment_to_seed(seed=self.seed,
-                                                fragment=new_fragment)
-                products.append(product)
+            # products = []
+            # for new_fragment in new_fragments:
+            #     product = add_fragment_to_seed(seed=self.seed,
+            #                                     fragment=new_fragment)
+            #     products.append(product)
             
-            mols_to_score = []
-            for product in products:
-                has_clash = self.get_pocket_ligand_clash(product)
-                if not has_clash:
-                    mols_to_score.append(self.get_clean_mol(product))
+            # mols_to_score = []
+            # for product in products:
+            #     has_clash = self.get_pocket_ligand_clash(product)
+            #     if not has_clash:
+            #         mols_to_score.append(self.get_clean_mol(product))
                 
-            if len(mols_to_score) > 0:
-                scores = self.scorer.get(mols_to_score)
-                max_i = np.argmin(scores)
-                reward = - scores[max_i] # minus to have a positive reward, maximize reward
-                self.seed = products[max_i]
-            else:
-                reward = -10.0 # Default reward, there is a clash
-                self.seed = products[0] # Default molecule is the first one
+            # if len(mols_to_score) > 0:
+            #     scores = self.scorer.get(mols_to_score)
+            #     max_i = np.argmin(scores)
+            #     reward = - scores[max_i] # minus to have a positive reward, maximize reward
+            #     self.seed = products[max_i]
+            # else:
+            #     reward = -10.0 # Default reward, there is a clash
+            #     self.seed = products[0] # Default molecule is the first one
+            new_fragment = new_fragments[0]
+            product = add_fragment_to_seed(seed=self.seed,
+                                           fragment=new_fragment)
+            mol = self.get_clean_mol(product)
+            scores = self.scorer.get([mol])
+            # Chem.MolToMolFile(mol, 'before_optim.mol')
+            # self.scorer.vina_scorer._vina.write_pose('after_optim.pdbqt', overwrite=True)
+            # import pdb;pdb.set_trace()
+            score = scores[0]
+            reward = -score # minus to have a positive reward, maximize reward
+            
             self.memory[state_action_t] = reward
+            
+        # TODO: put the optimized pose
+        self.seed = product
             
         return reward
         
@@ -207,14 +215,15 @@ class FragmentBuilderEnv():
         pocket_x = protein_x + ligand_x
         pocket_pos = protein_pos + ligand_pos
         
-        # mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
+        mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
         
-        x = torch.tensor(pocket_x, dtype=torch.float)
+        # x = torch.tensor(pocket_x, dtype=torch.float)
+        x = torch.tensor(pocket_x, dtype=torch.long)
         pos = torch.tensor(pocket_pos, dtype=torch.float)
-        # mol_id = torch.tensor(mol_id)
+        mol_id = torch.tensor(mol_id, dtype=torch.long)
         data = Data(x=x,
                     pos=pos,
-                    # mol_id=mol_id
+                    mol_id=mol_id
                     )
 
         return data
@@ -224,14 +233,14 @@ class FragmentBuilderEnv():
               complx: Complex,
               seed: Fragment,
               scorer: VinaScore,
-              complx_i: int,
+              seed_i: int,
               memory: dict) -> tuple[Data, dict[str, Any]]:
         
         self.complex = complx
         self.seed = Fragment(seed,
                              protections=seed.protections)
         self.scorer = scorer
-        self.complx_i = complx_i
+        self.seed_i = seed_i
         self.memory = memory
         
         self.pocket_mol = Mol(self.complex.pocket.mol)
@@ -735,7 +744,7 @@ class BatchEnv():
               complexes: list[Complex],
               seeds: list[Fragment],
               scorer: VinaScore,
-              complx_i: int) -> tuple[list[Data], list[dict[str, Any]]]:
+              seed_i: int) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
@@ -743,7 +752,7 @@ class BatchEnv():
             info = env.reset(complx,
                              seed,
                              scorer,
-                             complx_i,
+                             seed_i,
                              self.memory)
             batch_info.append(info)
         self.terminateds = [False] * len(self.envs)

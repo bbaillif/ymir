@@ -10,7 +10,8 @@ from scipy.spatial.distance import euclidean
 from ymir.utils.spatial import (rotate_conformer, 
                                 translate_conformer)
 from ymir.molecule_builder import potential_reactions
-from typing import Union
+from typing import Union, NamedTuple
+from tqdm import tqdm
 
 def get_neighbor_id_for_atom_id(mol: Mol,
                                 atom_id: int) -> int:
@@ -106,20 +107,10 @@ def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
     return unique_fragments
 
 
-def get_seed(complx: Complex) -> Fragment:
-    fragments = get_fragments_from_mol(complx.ligand)
+def get_construct(ligand: Mol,
+                removed_fragment: Fragment) -> Fragment:
     
-    fragments_1ap: list[Fragment] = []
-    for fragment in fragments:
-        aps = fragment.get_attach_points()
-        if len(aps) == 1:
-            fragments_1ap.append(fragment)
-            
-    # self.fragment_i = np.random.choice(len(fragments_1ap))
-    fragment_i = 0
-    removed_fragment = fragments_1ap[fragment_i]
-    
-    ligand_positions = complx.ligand.GetConformer().GetPositions()
+    ligand_positions = ligand.GetConformer().GetPositions()
     fragment_positions = removed_fragment.GetConformer().GetPositions()
     fragment_aps = removed_fragment.get_attach_points()
     fragment_ap_idx = list(fragment_aps.keys())[0]
@@ -135,14 +126,14 @@ def get_seed(complx: Complex) -> Fragment:
     ligand_ap_idx = int(min_dists_idx[fragment_ap_idx])
     ligand_neigh_idx = int(min_dists_idx[fragment_neigh_idx])
     
-    brics_bonds = Chem.BRICS.FindBRICSBonds(complx.ligand)
+    brics_bonds = Chem.BRICS.FindBRICSBonds(ligand)
     broken = False
     for bond in brics_bonds:
         t_bond, t_labels = bond
         t1 = (ligand_ap_idx, ligand_neigh_idx)
         t2 = (ligand_neigh_idx, ligand_ap_idx)
         if t_bond == t1 or t_bond == t2 :
-            new_mol = Chem.BRICS.BreakBRICSBonds(complx.ligand, bonds=[bond])
+            new_mol = Chem.BRICS.BreakBRICSBonds(ligand, bonds=[bond])
             broken = True
             break
     if not broken:
@@ -152,20 +143,44 @@ def get_seed(complx: Complex) -> Fragment:
     assert len(new_frags) == 2
     frag1, frag2 = new_frags
     if Chem.MolToSmiles(frag1) == Chem.MolToSmiles(removed_fragment):
-        seed = Fragment(frag2)
+        construct = Fragment(frag2)
     else:
         if Chem.MolToSmiles(frag2) != Chem.MolToSmiles(removed_fragment):
             if Chem.MolToSmiles(frag1, isomericSmiles=False) == Chem.MolToSmiles(removed_fragment, isomericSmiles=False):
-                seed = Fragment(frag2)
+                construct = Fragment(frag2)
             else:
                 if Chem.MolToSmiles(frag2, isomericSmiles=False) != Chem.MolToSmiles(removed_fragment, isomericSmiles=False):
                     import pdb;pdb.set_trace()
         # assert Chem.MolToSmiles(frag2) == Chem.MolToSmiles(self.removed_fragment)
-                seed = Fragment(frag1)
+                construct = Fragment(frag1)
         else:
-            seed = Fragment(frag1)
+            construct = Fragment(frag1)
             
-    return seed
+    return construct
+
+
+class ConstructionSeed(NamedTuple): 
+    construct: Fragment
+    removed_fragment: Fragment
+
+
+def get_seeds(ligand: Mol) -> list[ConstructionSeed]:
+    fragments = get_fragments_from_mol(ligand)
+    
+    fragments_1ap: list[Fragment] = []
+    for fragment in fragments:
+        aps = fragment.get_attach_points()
+        if len(aps) == 1:
+            fragments_1ap.append(fragment)
+            
+    seeds = []
+    for removed_fragment in fragments_1ap :
+        construct = get_construct(ligand, removed_fragment)
+        construction_seed = ConstructionSeed(construct, removed_fragment)
+        seeds.append(construction_seed)
+            
+    return seeds
+
 
 # Align the attach point ---> neighbor vector to the x axis: (0,0,0) ---> (1,0,0)
 # Then translate such that the neighbor is (0,0,0)
@@ -243,6 +258,31 @@ def select_mol_with_symbols(mols: list[Union[Mol, Fragment]],
                 if included]
     
     return out_mols
+
+
+def get_rotated_fragments(protected_fragments,
+                            torsion_angles_deg: list[float]) -> dict[str, Fragment]:
+        
+    print('Rotate fragments')
+    rotated_fragments = []
+    for protected_fragment in tqdm(protected_fragments):
+        for torsion_value in torsion_angles_deg:
+            new_fragment = Fragment(protected_fragment,
+                                    protections=protected_fragment.protections)
+            rotation = Rotation.from_euler('x', torsion_value)
+            rotate_conformer(new_fragment.GetConformer(), rotation)
+            rotated_fragments.append(new_fragment)
+            
+    return rotated_fragments
+
+def get_neighbor_symbol(fragment: Fragment):
+    aps = fragment.get_attach_points()
+    ap_atom_id = list(aps.keys())[0]
+    ap_atom = fragment.GetAtomWithIdx(ap_atom_id)
+    neighbors = ap_atom.GetNeighbors()
+    assert len(neighbors) == 1
+    return neighbors[0].GetSymbol()
+
 
 # class ProtectedFragment(Fragment):
     

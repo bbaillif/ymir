@@ -22,6 +22,7 @@ class VinaProtein(Protein):
                                                            '_protein_only_clean.pdb')
         self._pdbqt_filepath = pdb_filepath.replace('.pdb', 
                                                    '.pdbqt')
+        self._maps_prefix = pdb_filepath.replace('.pdb', '_maps')
         
         
     @property
@@ -52,7 +53,11 @@ class VinaProtein(Protein):
         assert os.path.exists(self._pdbqt_filepath), \
             'Something went wrong during Vina receptor preparation'
         return self._pdbqt_filepath
-        
+    
+    
+    @property
+    def maps_prefix(self):
+        return self._maps_prefix
         
     def vina_prepare_receptor(self,
                               universe: Universe,

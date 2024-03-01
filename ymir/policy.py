@@ -3,21 +3,16 @@ import torch
 from torch import nn
 from torch_geometric.data import Batch
 from e3nn import o3
-from ymir.model import ComENetModel
 from ymir.distribution import CategoricalMasked
-from typing import NamedTuple, Sequence
+from typing import NamedTuple
 from ymir.params import (EMBED_HYDROGENS, 
                          LMAX, 
-                         MAX_RADIUS,
-                         TORSION_ANGLES_DEG,
                          HIDDEN_IRREPS,
-                         IRREPS_FRAGMENTS,
-                         COMENET_CONFIG,
-                         FEATURES_DIM)
+                         IRREPS_OUTPUT)
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
-from ymir.featurizer_sn import Featurizer
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Batch
+from ymir.model import CNN
     
 class Action(NamedTuple): 
     frag_i: torch.Tensor # (batch_size)
@@ -38,15 +33,17 @@ class MultiLinear(nn.Module):
         assert len(hidden_dims) > 0
         dims = [input_dim] + hidden_dims
         modules = []
-        first_hidden = True
+        # first_hidden = True
         for dim1, dim2 in zip(dims, dims[1:]):
             modules.append(nn.Linear(dim1, dim2))
-            if first_hidden:
-                modules.append(nn.Tanh())
-                first_hidden = False
-            else:
-                modules.append(nn.SiLU())
+            # if first_hidden:
+                # modules.append(nn.Tanh())
+                # first_hidden = False
+            # else:
+            modules.append(nn.SiLU())
+            modules.append(nn.Dropout(p=0.25))
         modules.append(nn.Linear(dims[-1], output_dim))
+        # modules.append(nn.Tanh())
 
         self.sequential = nn.Sequential(*modules)
         
@@ -60,36 +57,54 @@ class Agent(nn.Module):
     def __init__(self, 
                  protected_fragments: list[Fragment],
                  atomic_num_table: AtomicNumberTable,
-                 features_dim: int = FEATURES_DIM,
+                #  features_dim: int = FEATURES_DIM,
+                 hidden_irreps: o3.Irreps = HIDDEN_IRREPS,
+                 irreps_output: o3.Irreps = IRREPS_OUTPUT,
                  lmax: int = LMAX,
-                 max_radius: float = MAX_RADIUS,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
         self.z_table = atomic_num_table
-        self.features_dim = features_dim
+        self.hidden_irreps = hidden_irreps
+        self.irreps_output = irreps_output
         self.lmax = lmax
-        self.max_radius = max_radius
         self.device = device
         self.embed_hydrogens = embed_hydrogens
         
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
         
-        self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
-                                                     features_dim=self.features_dim,
-                                                     readout='mean')
+        # self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
+        #                                              features_dim=self.features_dim,
+        #                                              readout='mean')
+        # # Fragment logit + 3D vector 
+        # hidden_dims = [self.features_dim, 
+        #                self.features_dim // 2]
+        # self.actor = MultiLinear(input_dim=self.features_dim, 
+        #                          hidden_dims=hidden_dims,
+        #                          output_dim=self.action_dim)
         
-        # Fragment logit + 3D vector 
-        hidden_dims = [self.features_dim, 
-                       self.features_dim // 2]
-        self.actor = MultiLinear(input_dim=self.features_dim, 
+        # self.critic = MultiLinear(input_dim=self.features_dim, 
+        #                          hidden_dims=hidden_dims,
+        #                          output_dim=1)
+        
+        self.pocket_feature_extractor = CNN(hidden_irreps=self.hidden_irreps,
+                                            irreps_output=self.irreps_output,
+                                             num_elements=len(self.z_table))
+        
+        assert(len(self.irreps_output) == 1) # only invariant features
+        self.inv_features_dim = self.irreps_output.dim
+        hidden_dims = [self.inv_features_dim * 2, 
+                    #    self.inv_features_dim, 
+                    #    self.inv_features_dim // 2
+                       ]
+        self.actor = MultiLinear(input_dim=self.inv_features_dim, 
                                  hidden_dims=hidden_dims,
                                  output_dim=self.action_dim)
         
-        self.critic = MultiLinear(input_dim=self.features_dim, 
+        self.critic = MultiLinear(input_dim=self.inv_features_dim, 
                                  hidden_dims=hidden_dims,
                                  output_dim=1)
 
@@ -105,6 +120,9 @@ class Agent(nn.Module):
 
     def extract_features(self,
                          x: Batch):
+        noise = torch.randn_like(x.pos) / 10 # variance of 0.1
+        noise = noise.to(x.pos)
+        x.pos = x.pos + noise
         features = self.pocket_feature_extractor(x)
         return features
     
@@ -115,7 +133,11 @@ class Agent(nn.Module):
                    frag_actions: torch.Tensor = None # (action_dim)
                    ) -> Action:
             
+        # inv_features, equi_features = self.split_features(features, self.hidden_irreps)
         frag_logits = self.actor(features)
+        frag_logits = torch.tanh(frag_logits)
+        frag_logits = frag_logits * 3 # from [-1;1] to [-3;3]
+        # if 2000 fragments, the maximum prob will be exp(3) / (exp(-3) *700 + exp(3)) = 0.30
         
         # Fragment sampling
         if torch.isnan(frag_logits).any():
@@ -137,6 +159,8 @@ class Agent(nn.Module):
 
     def get_value(self, 
                   features: torch.Tensor) -> torch.Tensor:
+        # inv_features, equi_features = self.split_features(features, self.hidden_irreps)
+        # critic_output = self.critic(inv_features)
         critic_output = self.critic(features)
         value = critic_output.squeeze(-1)
         return value

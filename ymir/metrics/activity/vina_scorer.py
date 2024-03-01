@@ -1,4 +1,6 @@
 import os
+import glob
+import logging
 import numpy as np
 
 from typing import List, Union
@@ -12,12 +14,12 @@ from meeko import (MoleculePreparation,
 from vina import Vina
 from MDAnalysis import AtomGroup
 from ymir.data.structure import VinaProtein
+from ymir.params import (DEFAULT_SF_NAME, 
+                         DEFAULT_PREPARATION_METHOD,
+                         DEFAULT_SIZE_BORDER,
+                         DEFAULT_N_CPUS,
+                         SEED)
 
-DEFAULT_SF_NAME = 'vina'
-DEFAULT_PREPARATION_METHOD = 'adfr'
-DEFAULT_SIZE_BORDER = 25 # Angstrom
-DEFAULT_N_CPUS = 8
-SEED = 2023
 
 class VinaScorer():
     
@@ -35,10 +37,12 @@ class VinaScorer():
         self.n_cpus = n_cpus
         self.seed = seed
         self.size_border = size_border
+        self._existing_maps = False
         
         self._vina = Vina(sf_name=sf_name,
                           cpu=n_cpus,
-                          seed=seed)
+                          seed=seed,
+                          verbosity=0)
         self._vina.set_receptor(self.vina_protein.pdbqt_filepath) 
         # will automatically perform protein preparation if 
         # the pdbqt file does not exist
@@ -56,6 +60,14 @@ class VinaScorer():
     #         os.mkdir(VINA_DIRPATH)
     #     os.system(f'wget {VINA_URL} -O {VINA_BIN_FILEPATH}')
         
+        
+    @property
+    def existing_maps(self):
+        if not self._existing_maps:
+            maps_prefix = self.vina_protein.maps_prefix
+            self._existing_maps = glob.glob('%s.*.map' % maps_prefix)
+        return self._existing_maps
+            
         
     @classmethod
     def from_ligand(cls,
@@ -116,6 +128,7 @@ class VinaScorer():
         # center = [d[f'center_{axis}'] for axis in 'xyz']
         # box_size = [d[f'size_{axis}'] for axis in 'xyz']
         
+        maps_prefix = self.vina_protein.maps_prefix
         if isinstance(ligand, Mol):
             conf = ligand.GetConformer()
             ligand_positions = conf.GetPositions()
@@ -127,8 +140,23 @@ class VinaScorer():
         center = (ligand_positions.max(axis=0) + ligand_positions.min(axis=0)) / 2
         # box_size = ligand_positions.max(axis=0) - ligand_positions.min(axis=0) + size_border
         box_size = [size_border] * 3
+        # if self.existing_maps:
+        #     logging.info('Loading map')
+        #     self._vina.load_maps(maps_prefix)
+        #     self._vina._center = center
+        #     self._vina._box_size = box_size
+        #     spacing = 0.375 # taken from vina code
+        #     self._vina._spacing = spacing
+        #     self._vina._voxels = np.ceil(np.array(box_size) / spacing).astype(int)
+        #     self._vina._voxels[0] += int(self._vina._voxels[0] % 2 == 1)
+        #     self._vina._voxels[1] += int(self._vina._voxels[1] % 2 == 1)
+        #     self._vina._voxels[2] += int(self._vina._voxels[2] % 2 == 1)
+        #     logging.info('Map loaded')
+        # else:
         self._vina.compute_vina_maps(center=center, 
-                                     box_size=box_size)
+                                    box_size=box_size,
+                                    force_even_voxels=True)
+            # self._vina.write_maps(maps_prefix, overwrite=True)
         
     # def write_box_from_ligand(self,
     #                              ligand: Union[Mol, AtomGroup],
@@ -165,7 +193,7 @@ class VinaScorer():
                    add_hydrogens: bool = True,) -> List[float]:
         
         assert self._vina._center is not None, \
-            'You need to setup the pocket box using the set_box_from_ligand function'
+            'You need to setup the pocket box using the set_box_from_ligand function to write maps'
             
         # Ligand preparation
         if add_hydrogens:

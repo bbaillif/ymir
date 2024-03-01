@@ -17,11 +17,11 @@ from e3nn import o3
 
 from ymir.fragment_library import FragmentLibrary
 from ymir.data.structure import Complex
-from ymir.utils.fragment import (get_fragments_from_mol, 
-                                 get_seed, 
+from ymir.utils.fragment import (get_seeds, 
                                  center_fragments, 
                                  get_masks,
-                                 select_mol_with_symbols)
+                                 select_mol_with_symbols,
+                                 ConstructionSeed)
 
 from ymir.atomic_num_table import AtomicNumberTable
 
@@ -30,7 +30,8 @@ from ymir.env import (FragmentBuilderEnv,
 from ymir.policy import Agent, Action
 from ymir.data import Fragment
 from ymir.params import (EMBED_HYDROGENS, 
-                         HIDDEN_IRREPS)
+                         HIDDEN_IRREPS,
+                         SEED)
 from ymir.metrics.activity import VinaScore, VinaScorer
 
 logging.basicConfig(filename='train.log', 
@@ -40,7 +41,7 @@ logging.basicConfig(filename='train.log',
                     datefmt='%d/%m/%Y %I:%M:%S %p',
                     filemode="w")
 
-seed = 420
+seed = SEED
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 random.seed(seed)
 np.random.seed(seed)
@@ -49,11 +50,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 32 # we will have protein envs in parallel
+n_envs = 64 # we will have protein envs in parallel
 batch_size = min(n_envs, 32) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 1e-4
+lr = 5e-4
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -62,8 +63,8 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 1
-use_entropy_loss = True
+n_complexes = 50
+use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -108,9 +109,9 @@ protected_fragments = [fragment
                        if n == 1]
            
 # TO CHANGE/REMOVE
-n_fragments = 100
 random.shuffle(protected_fragments)
-protected_fragments = protected_fragments[:n_fragments]
+# n_fragments = 100
+# protected_fragments = protected_fragments[:n_fragments]
 protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
 
 protein_paths = []
@@ -123,42 +124,49 @@ assert len(ligands) == len(protein_paths)
 
 logging.info('Loading complexes')
 
+# Get complexes with a correct Vina setup, and having a one-attach-point fragment in our list
 not_working_protein = []
 complexes: list[Complex] = []
-# vina_scores: list[VinaScore] = []
+seed_to_complex: list[int] = []
+all_seeds: list[ConstructionSeed] = []
+complex_counter = 0
 for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_paths)):
-    try:
-        complx = Complex(ligand, protein_path)
-        fragments = get_fragments_from_mol(ligand)
-        has_frag_1_ap = False
-        for fragment in fragments:
-            attach_points = fragment.get_attach_points()
-            if 7 in attach_points.values():
-                raise Exception("double bond BRICS, we don't include these")
-            if len(attach_points) == 1:
-                frag_smiles = Chem.MolToSmiles(fragment)
-                if frag_smiles in protected_fragments_smiles:
-                    has_frag_1_ap = True
-        if not has_frag_1_ap:
-            raise Exception('We look for fragments with one attach points')
-        assert len(fragments) > 1, 'Ligand is not fragmentable (or double bond reaction)'
-        vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
-        # vina_scorer.set_box_from_ligand(complx.ligand)
-        # vina_score = VinaScore(vina_scorer=vina_scorer)
-    except Exception as e:
-        logging.warning(f'Error on {protein_path}: {e}')
-        not_working_protein.append(protein_path)
-    else:
-        complexes.append(complx)
-        if len(complexes) == n_complexes:
-            break
-        # vina_scores.append(vina_score)
-
-# Get the seed constructions
-seeds = []
-for complx in complexes:
-    seed = get_seed(complx)
-    seeds.append(seed)
+    
+    seeds = get_seeds(ligand)
+    correct_seeds = []
+    for seed in seeds:
+        construct, removed_fragment = seed
+        attach_points = construct.get_attach_points()
+        assert len(attach_points) == 1
+        if 7 in attach_points.values():
+            continue
+        
+        frag_smiles = Chem.MolToSmiles(removed_fragment)
+        if frag_smiles in protected_fragments_smiles:
+            correct_seeds.append(seed)
+    
+    if len(correct_seeds) > 0:
+        try:
+            complx = Complex(ligand, protein_path)
+            vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
+            pocket = complx.pocket # Detect the short pocket situations
+            
+        except Exception as e:
+            logging.warning(f'Error on {protein_path}: {e}')
+            not_working_protein.append(protein_path)
+            
+        else:
+            complexes.append(complx)
+            for seed in correct_seeds:
+                all_seeds.append(seed)
+                seed_to_complex.append(complex_counter)
+            complex_counter += 1
+            
+            # TO REMOVE IN FINAL
+            if complex_counter == n_complexes:
+                break
+            
+n_seeds = len(all_seeds)
 
 center_fragments(protected_fragments)
 final_fragments = protected_fragments
@@ -173,14 +181,16 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
                                                     valid_action_masks=valid_action_masks,
                                                     embed_hydrogens=EMBED_HYDROGENS)
                                   for _ in range(n_envs)]
-state_action = tuple[int, int] # (complx_i, action_i)
+state_action = tuple[int, int] # (seed_i, action_i)
 memory: dict[state_action, float] = {}
 batch_env = BatchEnv(envs,
                      memory)
 
 agent = Agent(protected_fragments=final_fragments,
               atomic_num_table=z_table)
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_27_02_2024_01_17_44_5000.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_28_02_2024_18_20_19_8000.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_29_02_2024_00_42_18_18000.pt')
+
 # agent.load_state_dict(state_dict)
 
 agent = agent.to(device)
@@ -198,20 +208,21 @@ try:
         
         logging.debug(f'Episode i: {episode_i}')
         
-        complx_i = episode_i % n_complexes
-        current_complexes = [complexes[complx_i]] * n_envs
-        current_seeds = [seeds[complx_i]] * n_envs
-        # vina_score = vina_scores[complx_i]
+        seed_i = episode_i % n_seeds
+        current_seeds = [all_seeds[seed_i]] * n_envs
+        current_constructs = [seed.construct for seed in current_seeds]
+        complex_idxs = [seed_to_complex[seed_i]] * n_envs
+        current_complexes = [complexes[idx] for idx in complex_idxs]
         
         complx = current_complexes[0]
         vina_scorer = VinaScorer(complx.vina_protein)
         vina_scorer.set_box_from_ligand(complx.ligand)
-        vina_score = VinaScore(vina_scorer=vina_scorer)
+        vina_score = VinaScore(vina_scorer=vina_scorer, minimized=True)
         
         next_info = batch_env.reset(current_complexes,
-                                    current_seeds,
+                                    current_constructs,
                                     vina_score,
-                                    complx_i)
+                                    seed_i)
         next_terminated = [False] * n_envs
         
         # each first dimension of list is the number of total steps
@@ -414,7 +425,7 @@ try:
                                             clip_value=max_grad_value)
                     optimizer.step()
         
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
         
         logging.info(f'Second loop time: {time.time() - start_time}')
                 
@@ -426,6 +437,7 @@ try:
         writer.add_scalar("losses/loss", loss.item(), episode_i)
         
         flat_rewards = torch.cat(rewards)
+        # import pdb;pdb.set_trace()
         writer.add_scalar("reward/mean_reward", flat_rewards.mean(), episode_i)
         
         if ((episode_i + 1) % 500 == 0):
@@ -435,7 +447,9 @@ try:
 except KeyboardInterrupt:
     import pdb;pdb.set_trace()
         
-    # import pdb;pdb.set_trace()
+except Exception as e:
+    print(e)
+    import pdb;pdb.set_trace()
         
 # agent = Agent(*args, **kwargs)
 # agent.load_state_dict(torch.load(PATH))
