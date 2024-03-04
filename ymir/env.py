@@ -22,6 +22,7 @@ from ymir.params import EMBED_HYDROGENS
 from ymir.featurizer_sn import Featurizer
 from ymir.metrics.activity import VinaScore
 from ymir.bond_distance import MedianBondDistance
+from ymir.metrics.activity.vina_cli import VinaCLI
 
 
 class FragmentBuilderEnv():
@@ -142,55 +143,17 @@ class FragmentBuilderEnv():
         
         
     def action_to_fragment_build(self,
-                                 frag_action: int) -> float:
+                                 frag_action: int) -> None:
         
         new_fragments = self.get_new_fragments(frag_action)
         self.translate_seed(fragment=new_fragments[0])
         
-        state_action_t = (self.seed_i, frag_action)
-        if state_action_t in self.memory: # we know what it does, so no need to recompute
-            reward = self.memory[state_action_t]
-            new_fragment = new_fragments[0]
-            product = add_fragment_to_seed(seed=self.seed,
-                                            fragment=new_fragment)
-        else:
-            # products = []
-            # for new_fragment in new_fragments:
-            #     product = add_fragment_to_seed(seed=self.seed,
-            #                                     fragment=new_fragment)
-            #     products.append(product)
-            
-            # mols_to_score = []
-            # for product in products:
-            #     has_clash = self.get_pocket_ligand_clash(product)
-            #     if not has_clash:
-            #         mols_to_score.append(self.get_clean_mol(product))
-                
-            # if len(mols_to_score) > 0:
-            #     scores = self.scorer.get(mols_to_score)
-            #     max_i = np.argmin(scores)
-            #     reward = - scores[max_i] # minus to have a positive reward, maximize reward
-            #     self.seed = products[max_i]
-            # else:
-            #     reward = -10.0 # Default reward, there is a clash
-            #     self.seed = products[0] # Default molecule is the first one
-            new_fragment = new_fragments[0]
-            product = add_fragment_to_seed(seed=self.seed,
-                                           fragment=new_fragment)
-            mol = self.get_clean_mol(product)
-            scores = self.scorer.get([mol])
-            # Chem.MolToMolFile(mol, 'before_optim.mol')
-            # self.scorer.vina_scorer._vina.write_pose('after_optim.pdbqt', overwrite=True)
-            # import pdb;pdb.set_trace()
-            score = scores[0]
-            reward = -score # minus to have a positive reward, maximize reward
-            
-            self.memory[state_action_t] = reward
+        new_fragment = new_fragments[0]
+        product = add_fragment_to_seed(seed=self.seed,
+                                        fragment=new_fragment)
             
         # TODO: put the optimized pose
         self.seed = product
-            
-        return reward
         
     
     def _get_obs(self):
@@ -234,14 +197,15 @@ class FragmentBuilderEnv():
               seed: Fragment,
               scorer: VinaScore,
               seed_i: int,
-              memory: dict) -> tuple[Data, dict[str, Any]]:
+            #   memory: dict
+              ) -> tuple[Data, dict[str, Any]]:
         
         self.complex = complx
         self.seed = Fragment(seed,
                              protections=seed.protections)
         self.scorer = scorer
         self.seed_i = seed_i
-        self.memory = memory
+        # self.memory = memory
         
         self.pocket_mol = Mol(self.complex.pocket.mol)
         
@@ -299,7 +263,7 @@ class FragmentBuilderEnv():
         self.actions.append(frag_action)
         n_actions = len(self.actions)
         
-        reward = self.action_to_fragment_build(frag_action) # seed is deprotected
+        self.action_to_fragment_build(frag_action) # seed is deprotected
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
@@ -307,6 +271,7 @@ class FragmentBuilderEnv():
         if not self.terminated:
             import pdb;pdb.set_trace()
         assert self.terminated, 'Something is wrong with the fragmentation code'
+        reward = 0
         
         if n_actions == self.max_episode_steps: # not terminated but reaching max step size
             self.truncated = True
@@ -743,8 +708,8 @@ class BatchEnv():
     def reset(self,
               complexes: list[Complex],
               seeds: list[Fragment],
-              scorer: VinaScore,
-              seed_i: int) -> tuple[list[Data], list[dict[str, Any]]]:
+              scorer: VinaScore = None,
+              seed_i: int = None) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
@@ -753,7 +718,8 @@ class BatchEnv():
                              seed,
                              scorer,
                              seed_i,
-                             self.memory)
+                            #  self.memory
+                             )
             batch_info.append(info)
         self.terminateds = [False] * len(self.envs)
         self.ongoing_env_idxs = list(range(len(self.envs)))
@@ -829,7 +795,7 @@ class BatchEnv():
         batch_truncated = []
         batch_info = []
         mols = []
-        batch_rewards = []
+        old_batch_rewards = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             frag_action = int(frag_action)
@@ -838,11 +804,27 @@ class BatchEnv():
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
             
-            batch_rewards.append(reward)
+            old_batch_rewards.append(reward)
             batch_truncated.append(truncated)
             batch_info.append(info)
             
             mols.append(env.get_clean_mol(env.seed))
+        
+        # import time
+        # st = time.time()
+        vina_cli = VinaCLI()
+        receptor_paths = [env.complex.vina_protein.pdbqt_filepath 
+                          for env in self.envs]
+        native_ligands = [env.complex.ligand 
+                          for env in self.envs]
+        scores = vina_cli.get(receptor_paths=receptor_paths,
+                            native_ligands=native_ligands,
+                            ligands=mols)
+        batch_rewards = [-score for score in scores]
+        # print(batch_rewards)
+        # print(time.time() - st)
+        # import pdb;pdb.set_trace()
+        
         
         for i, (reward, truncated) in enumerate(zip(batch_rewards, batch_truncated)):
             if truncated:

@@ -3,6 +3,7 @@ import torch
 import random
 import numpy as np
 import logging
+# import wandb
 
 from torch import nn
 from tqdm import tqdm
@@ -50,11 +51,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 64 # we will have protein envs in parallel
+n_envs = 24 # we will have protein envs in parallel
 batch_size = min(n_envs, 32) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 5e-4
+lr = 1e-4
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -63,13 +64,24 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 50
+n_complexes = 50000000
 use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
 
 writer = SummaryWriter(f"logs/{experiment_name}")
+# wandb.login()
+# run = wandb.init(
+#     # Set the project where this run will be logged
+#     project="ymir_v1",
+#     # Track hyperparameters and run metadata
+#     config={
+#         "n_complexes": n_complexes,
+#         "use_entropy_loss": False,
+#         "lr": 5e-4,
+#     },
+# )
 
 removeHs = not EMBED_HYDROGENS
 fragment_library = FragmentLibrary(removeHs=removeHs)
@@ -148,7 +160,8 @@ for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_
     if len(correct_seeds) > 0:
         try:
             complx = Complex(ligand, protein_path)
-            vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
+            # vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
+            vina_protein = complx.vina_protein
             pocket = complx.pocket # Detect the short pocket situations
             
         except Exception as e:
@@ -208,21 +221,28 @@ try:
         
         logging.debug(f'Episode i: {episode_i}')
         
-        seed_i = episode_i % n_seeds
-        current_seeds = [all_seeds[seed_i]] * n_envs
+        start_idx = episode_i * n_envs % n_seeds
+        end_idx = (episode_i + 1) * n_envs % n_seeds
+        if start_idx > end_idx:
+            seed_idxs = list(range(0, end_idx)) + list(range(start_idx, n_seeds))
+        else:
+            seed_idxs = list(range(start_idx, end_idx))
+        logging.info(seed_idxs)
+        current_seeds = [all_seeds[seed_i] for seed_i in seed_idxs]
         current_constructs = [seed.construct for seed in current_seeds]
-        complex_idxs = [seed_to_complex[seed_i]] * n_envs
+        complex_idxs = [seed_to_complex[seed_i] for seed_i in seed_idxs]
         current_complexes = [complexes[idx] for idx in complex_idxs]
         
-        complx = current_complexes[0]
-        vina_scorer = VinaScorer(complx.vina_protein)
-        vina_scorer.set_box_from_ligand(complx.ligand)
-        vina_score = VinaScore(vina_scorer=vina_scorer, minimized=True)
+        # complx = current_complexes[0]
+        # vina_scorer = VinaScorer(complx.vina_protein)
+        # vina_scorer.set_box_from_ligand(complx.ligand)
+        # vina_score = VinaScore(vina_scorer=vina_scorer, minimized=True)
         
         next_info = batch_env.reset(current_complexes,
                                     current_constructs,
-                                    vina_score,
-                                    seed_i)
+                                    # vina_score,
+                                    # seed_i
+                                    )
         next_terminated = [False] * n_envs
         
         # each first dimension of list is the number of total steps
@@ -429,15 +449,24 @@ try:
         
         logging.info(f'Second loop time: {time.time() - start_time}')
                 
+        flat_rewards = torch.cat(rewards)
+        # try:
+        #     wandb.log({"value_loss": v_loss.item(), 
+        #             "fragment_policy_loss": frag_pg_loss.item(),
+        #             "fragment_entropy": frag_entropy_loss.mean().item(),
+        #             "fragment_approx_kl": frag_approx_kl.item(),
+        #             "loss": loss.item(),
+        #             "mean_reward": flat_rewards.mean()})
+        # except Exception as e:
+        #     print(e)
+        #     import pdb;pdb.set_trace()
+                
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]['lr'], episode_i)
         writer.add_scalar("losses/value_loss", v_loss.item(), episode_i)
         writer.add_scalar("losses/fragment_policy_loss", frag_pg_loss.item(), episode_i)
         writer.add_scalar("losses/fragment_entropy", frag_entropy_loss.mean().item(), episode_i)
         writer.add_scalar("losses/fragment_approx_kl", frag_approx_kl.item(), episode_i)
         writer.add_scalar("losses/loss", loss.item(), episode_i)
-        
-        flat_rewards = torch.cat(rewards)
-        # import pdb;pdb.set_trace()
         writer.add_scalar("reward/mean_reward", flat_rewards.mean(), episode_i)
         
         if ((episode_i + 1) % 500 == 0):

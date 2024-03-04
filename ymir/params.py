@@ -129,3 +129,15 @@ DEFAULT_N_CPUS = 8
 SEED = 2023
 
 N_INTERACTION_BLOCKS = 2
+
+VINA_DIRECTORY = '/home/bb596/ymir/vina/'
+VINA_LIGANDS_DIRECTORY = '/home/bb596/ymir/vina/ligands/'
+if not os.path.exists(VINA_LIGANDS_DIRECTORY):
+    os.mkdir(VINA_LIGANDS_DIRECTORY)
+VINA_OUTPUT_DIRECTORY = '/home/bb596/ymir/vina/poses/'
+if not os.path.exists(VINA_OUTPUT_DIRECTORY):
+    os.mkdir(VINA_OUTPUT_DIRECTORY)
+VINA_CPUS = 12
+VINA_SEED = SEED
+VINA_CONFIG_PATH = '/home/bb596/ymir/vina/config.txt'
+VINA_PATH = '/home/bb596/ymir/vina/vina_1.2.5_linux_x86_64'
