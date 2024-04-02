@@ -43,12 +43,12 @@ class Complex():
         
     @property
     def pocket(self) -> Pocket:
-        pocket = Pocket(protein=self.protein_clean, 
-                        native_ligand=self.ligand)
-        return pocket
-        # if self._pocket is None:
-        #     self._pocket = Pocket(protein=self.protein_clean, 
-        #                             native_ligand=self.ligand)
-        # return self._pocket
+        # pocket = Pocket(protein=self.protein_clean, 
+        #                 native_ligand=self.ligand)
+        # return pocket
+        if self._pocket is None:
+            self._pocket = Pocket(protein=self.protein_clean, 
+                                    native_ligand=self.ligand)
+        return self._pocket
     
     

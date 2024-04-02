@@ -18,7 +18,7 @@ def run_vina(vina_cmd: list[str]):
     score = 0
     try:
         vina_cmd = ' '.join(vina_cmd)
-        completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=10)
+        completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
         stdout = completed_process.stdout.decode('utf-8')
         stderr = completed_process.stderr.decode('utf-8')
         # logging.info(stdout)
@@ -86,7 +86,7 @@ class VinaCLI():
         try:
             with Pool(self.n_threads, maxtasksperchild=1) as pool:
                 results = pool.map_async(run_vina, vina_cmds)
-                for score in results.get(timeout=10):
+                for score in results.get(timeout=10*len(ligands)):
                     scores.append(score)
                 pool.close()
                 pool.join()
