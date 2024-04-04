@@ -1,5 +1,6 @@
 import torch
 
+from torch import nn
 from torch_cluster import radius_graph
 from torch_scatter import scatter
 from e3nn.math import (soft_one_hot_linspace,
@@ -44,6 +45,9 @@ class InteractionBlock(torch.nn.Module):
         self.value_weights_fc = FullyConnectedNet(hs=self.value_weights_hs, 
                                                   act=torch.nn.functional.silu)
         
+        self.layer_norm = nn.LayerNorm(self.irreps_output.dim)
+        # self.layer_norm = nn.BatchNorm1d(self.irreps_output.dim)
+        
     def forward(self,
                 x: torch.Tensor, # (num_nodes, feature_size)
                 edge_sh: torch.Tensor, # (num_edges, sh_dim)
@@ -62,6 +66,7 @@ class InteractionBlock(torch.nn.Module):
                               edge_dst, 
                               dim=0)
         node_values = node_values / (avg_num_neighbors ** 0.5)
+        node_values = self.layer_norm(node_values)
         return node_values
 
 
@@ -169,6 +174,8 @@ class CNN(torch.nn.Module):
                                           edge_src,
                                           edge_dst,
                                           avg_num_neighbors)
+            
+        return x
             
         output = scatter(x,
                          batch.batch,

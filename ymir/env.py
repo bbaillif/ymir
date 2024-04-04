@@ -708,6 +708,7 @@ class BatchEnv():
     def reset(self,
               complexes: list[Complex],
               seeds: list[Fragment],
+              initial_scores: list[float],
               scorer: VinaScore = None,
               seed_i: int = None) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
@@ -723,6 +724,19 @@ class BatchEnv():
             batch_info.append(info)
         self.terminateds = [False] * len(self.envs)
         self.ongoing_env_idxs = list(range(len(self.envs)))
+        
+        # vina_cli = VinaCLI()
+        # receptor_paths = [env.complex.vina_protein.pdbqt_filepath 
+        #                   for env in self.envs]
+        # native_ligands = [env.complex.ligand 
+        #                   for env in self.envs]
+        # native_ligands_h = [Chem.AddHs(mol, addCoords=True) 
+        #                     for mol in native_ligands]
+        # scores = vina_cli.get(receptor_paths=receptor_paths,
+        #                     native_ligands=native_ligands,
+        #                     ligands=native_ligands_h)
+        
+        self.current_scores = initial_scores
         
         return batch_info
     
@@ -820,7 +834,12 @@ class BatchEnv():
         scores = vina_cli.get(receptor_paths=receptor_paths,
                             native_ligands=native_ligands,
                             ligands=mols)
-        batch_rewards = [-score for score in scores]
+        relative_scores = [new_score - previous_score 
+                           for new_score, previous_score in zip(scores, self.current_scores)]
+        batch_rewards = [-score for score in relative_scores]
+        
+        self.current_scores = scores
+        
         # print(batch_rewards)
         # print(time.time() - st)
         # import pdb;pdb.set_trace()

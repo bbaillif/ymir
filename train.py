@@ -34,6 +34,7 @@ from ymir.params import (EMBED_HYDROGENS,
                          HIDDEN_IRREPS,
                          SEED)
 from ymir.metrics.activity import VinaScore, VinaScorer
+from ymir.metrics.activity.vina_cli import VinaCLI
 
 logging.basicConfig(filename='train.log', 
                     encoding='utf-8', 
@@ -64,13 +65,14 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 50000000
+n_complexes = 50
 use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
 
 writer = SummaryWriter(f"logs/{experiment_name}")
+
 # wandb.login()
 # run = wandb.init(
 #     # Set the project where this run will be logged
@@ -120,11 +122,22 @@ protected_fragments = [fragment
                        for fragment, n in zip(protected_fragments, n_attaches)
                        if n == 1]
            
+unique_fragments = []
+unique_smiles = []
+for mol in protected_fragments:
+    smiles = Chem.MolToSmiles(mol)
+    if not smiles in unique_smiles:
+        unique_smiles.append(smiles)
+        unique_fragments.append(mol)
+        
+protected_fragments = unique_fragments
+           
 # TO CHANGE/REMOVE
-random.shuffle(protected_fragments)
+# random.shuffle(protected_fragments)
 # n_fragments = 100
 # protected_fragments = protected_fragments[:n_fragments]
-protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
+# protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
+protected_fragments_smiles = unique_smiles
 
 protein_paths = []
 for ligand in ligands:
@@ -178,6 +191,17 @@ for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_
             # TO REMOVE IN FINAL
             if complex_counter == n_complexes:
                 break
+         
+vina_cli = VinaCLI()
+receptor_paths = [complex.vina_protein.pdbqt_filepath 
+                    for complex in complexes]
+native_ligands = [complex.ligand 
+                    for complex in complexes]
+native_ligands_h = [Chem.AddHs(mol, addCoords=True) 
+                    for mol in native_ligands]
+native_scores = vina_cli.get(receptor_paths=receptor_paths,
+                    native_ligands=native_ligands,
+                    ligands=native_ligands_h)
             
 n_seeds = len(all_seeds)
 
@@ -228,10 +252,12 @@ try:
         else:
             seed_idxs = list(range(start_idx, end_idx))
         logging.info(seed_idxs)
+        
         current_seeds = [all_seeds[seed_i] for seed_i in seed_idxs]
         current_constructs = [seed.construct for seed in current_seeds]
         complex_idxs = [seed_to_complex[seed_i] for seed_i in seed_idxs]
         current_complexes = [complexes[idx] for idx in complex_idxs]
+        current_scores = [native_scores[idx] for idx in complex_idxs]
         
         # complx = current_complexes[0]
         # vina_scorer = VinaScorer(complx.vina_protein)
@@ -240,6 +266,7 @@ try:
         
         next_info = batch_env.reset(current_complexes,
                                     current_constructs,
+                                    initial_scores=current_scores
                                     # vina_score,
                                     # seed_i
                                     )
@@ -277,10 +304,12 @@ try:
                 features = agent.extract_features(x)
                 current_masks = current_masks.to(device)
                 current_action: Action = agent.get_action(features,
+                                                          batch=x.batch,
                                                             masks=current_masks)
                 current_frag_actions = current_action.frag_i.cpu()
                 current_frag_logprobs = current_action.frag_logprob.cpu()
-                current_values = agent.get_value(features)
+                current_values = agent.get_value(features,
+                                                 batch=x.batch)
                 # current_values = current_values.squeeze(dim=-1)
                 
             frag_actions.append(current_frag_actions)
@@ -400,6 +429,7 @@ try:
                     current_masks = mb_masks.to(device)
                     current_frag_actions = mb_frag_actions.to(device)
                     current_action = agent.get_action(features=features,
+                                                      batch=x.batch,
                                                         masks=current_masks,
                                                         frag_actions=current_frag_actions)
                     
@@ -423,7 +453,8 @@ try:
                     mb_values = b_values[minibatch_inds]
                     mb_returns = mb_returns.to(device)
                     mb_values = mb_values.to(device)
-                    current_values = agent.get_value(features=features)
+                    current_values = agent.get_value(features=features,
+                                                     batch=x.batch)
                     v_loss_unclipped = ((current_values - mb_returns) ** 2)
                     v_clipped = mb_values + torch.clamp(current_values - mb_values, 
                                                         -clip_coef, 
@@ -468,6 +499,9 @@ try:
         writer.add_scalar("losses/fragment_approx_kl", frag_approx_kl.item(), episode_i)
         writer.add_scalar("losses/loss", loss.item(), episode_i)
         writer.add_scalar("reward/mean_reward", flat_rewards.mean(), episode_i)
+        
+        # if ((episode_i + 1) % 500 == 0):
+        #     import pdb;pdb.set_trace()
         
         if ((episode_i + 1) % 500 == 0):
             save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt'
