@@ -141,3 +141,5 @@ VINA_CPUS = 12
 VINA_SEED = SEED
 VINA_CONFIG_PATH = '/home/bb596/ymir/vina/config.txt'
 VINA_PATH = '/home/bb596/ymir/vina/vina_1.2.5_linux_x86_64'
+
+VINA_DATASET_PATH = '/home/bb596/hdd/ymir/vina_mini_dataset.p'

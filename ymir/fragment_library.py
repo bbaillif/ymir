@@ -5,7 +5,7 @@ from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import Mol
 from ymir.data import PDBbind
-from ymir.utils.fragment import get_unique_fragments_from_mols
+from ymir.utils.fragment import get_unique_fragments_from_mols, select_mol_with_symbols
 from ymir.data import Fragment
 from ymir.utils.mol_conversion import (rdkit_conf_to_ccdc_mol, 
                                        ccdc_mol_to_rdkit_mol)
@@ -148,3 +148,47 @@ class FragmentLibrary():
         
         return protected_fragments
                 
+
+    def get_restricted_fragments(self,
+                                 z_list: list[int]):
+        protected_fragments = select_mol_with_symbols(self.protected_fragments,
+                                              z_list)
+
+        # Select only fragments with 1 attach point
+        n_attaches = []
+        for fragment in protected_fragments:
+            frag_copy = Fragment(mol=fragment,
+                                protections=fragment.protections)
+            frag_copy.unprotect()
+            attach_points = frag_copy.get_attach_points()
+            n_attach = len(attach_points)
+            n_attaches.append(n_attach)
+
+        protected_fragments = [fragment 
+                            for fragment, n in zip(protected_fragments, n_attaches)
+                            if n == 1]
+                
+        unique_fragments = []
+        unique_smiles = []
+        for mol in protected_fragments:
+            smiles = Chem.MolToSmiles(mol)
+            if not smiles in unique_smiles:
+                unique_smiles.append(smiles)
+                unique_fragments.append(mol)
+                
+        protected_fragments = unique_fragments
+        
+        return protected_fragments
+    
+    
+    def get_restricted_ligands(self,
+                               z_list: list[int]):
+        ligands = [ligand 
+                for ligand in self.ligands 
+                if ligand.GetNumHeavyAtoms() < 50]
+
+        # Remove ligands having at least one heavy atom not in list
+        ligands = select_mol_with_symbols(ligands,
+                                        z_list)
+        
+        return ligands

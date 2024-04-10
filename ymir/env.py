@@ -1,11 +1,13 @@
 import numpy as np
 import torch
 import logging
+import io
 
 from rdkit import Chem
 from rdkit.Chem import Mol
+from ase.io import read
 from ymir.molecule_builder import add_fragment_to_seed
-from ymir.utils.fragment import get_fragments_from_mol, get_neighbor_symbol
+from ymir.utils.fragment import get_fragments_from_mol, get_neighbor_symbol, center_fragment
 from ymir.data.structure.complex import Complex
 from torch_geometric.data import Data
 from ymir.data import Fragment
@@ -23,6 +25,8 @@ from ymir.featurizer_sn import Featurizer
 from ymir.metrics.activity import VinaScore
 from ymir.bond_distance import MedianBondDistance
 from ymir.metrics.activity.vina_cli import VinaCLI
+from dscribe.descriptors import SOAP
+from sklearn.preprocessing import normalize
 
 
 class FragmentBuilderEnv():
@@ -53,51 +57,38 @@ class FragmentBuilderEnv():
         self.featurizer = Featurizer(z_table=self.z_table)
         self.mbd = MedianBondDistance()
         
+        species = ['C', 'N', 'O', 'Cl', 'S']
+        if self.embed_hydrogens:
+            species = ['H'] + species
+        self.soap = SOAP(species=species,
+                        periodic=False,
+                        r_cut=8,
+                        n_max=8,
+                        l_max=6)
+        
     @property
     def action_dim(self) -> int:
         return self._action_dim
         
         
     def seed_to_frame(self):
-        for atom in self.seed.GetAtoms():
-            if atom.GetAtomicNum() == 0:
-                attach_point = atom
-                break
-        
+
         # Chem.MolToMolFile(self.seed, 'seed_before.mol')
         # Chem.MolToMolFile(self.pocket_mol, 'pocket_before.mol')
         
         # Align the neighbor ---> attach point vector to the x axis: (0,0,0) ---> (1,0,0)
         # Then translate such that the neighbor is (0,0,0)
-        neighbor = attach_point.GetNeighbors()[0]
-        neighbor_id = neighbor.GetIdx()
-        attach_id = attach_point.GetIdx()
-        positions = self.seed.GetConformer().GetPositions()
-        # neighbor_attach = positions[[neighbor_id, attach_id]]
-        # distance = euclidean(neighbor_attach[0], neighbor_attach[1])
-        # x_axis_vector = np.array([[0,0,0], [distance,0,0]])
-        neighbor_pos = positions[neighbor_id]
-        attach_pos = positions[attach_id]
-        neighbor_attach = attach_pos - neighbor_pos
-        distance = euclidean(attach_pos, neighbor_pos)
-        x_axis_vector = np.array([distance, 0, 0])
-        # import pdb;pdb.set_trace()
-        rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=neighbor_attach.reshape(-1, 3))
-        rotate_conformer(conformer=self.seed.GetConformer(),
-                         rotation=rotation)
+        transformations = center_fragment(self.seed,
+                                          attach_to_neighbor=False,
+                                          neighbor_is_zero=True)
+        
+        rotation, translation = transformations
         rotate_conformer(conformer=self.pocket_mol.GetConformer(),
                          rotation=rotation)
-        
-        positions = self.seed.GetConformer().GetPositions()
-        neighbor_pos = positions[neighbor_id]
-        translation = -neighbor_pos
-        translate_conformer(conformer=self.seed.GetConformer(),
-                            translation=translation)
         translate_conformer(conformer=self.pocket_mol.GetConformer(),
                             translation=translation)
         
-        self.transformations.append(rotation)
-        self.transformations.append(translation)
+        self.transformations.extend(transformations)
         
         # Chem.MolToMolFile(self.seed, 'seed_after.mol')
         # Chem.MolToMolFile(self.pocket_mol, 'pocket_after.mol')
@@ -166,8 +157,31 @@ class FragmentBuilderEnv():
         return {}
     
     
+    def rdkit_to_ase(self,
+                     mol: Mol):
+        filename = 'mol.xyz'
+        Chem.MolToXYZFile(mol, filename)
+        ase_atoms = read(filename)
+        return ase_atoms
+        
+    
     def featurize_pocket(self) -> Data:
         center_pos = [0, 0, 0]
+        seed_copy = Fragment(self.seed, self.seed.protections)
+        seed_copy.protect()
+        seed_atoms = self.rdkit_to_ase(seed_copy)
+        pocket_atoms = self.rdkit_to_ase(self.pocket_mol)
+        if not self.embed_hydrogens:
+            seed_atoms = seed_atoms[[atom.index for atom in seed_atoms if atom.symbol != 'H']]
+            pocket_atoms = pocket_atoms[[atom.index for atom in pocket_atoms if atom.symbol != 'H']]
+        
+        total_atoms = seed_atoms + pocket_atoms
+        seed_soap = self.soap.create(total_atoms, centers=[center_pos])
+
+        seed_soap = normalize(seed_soap)
+
+        return seed_soap.squeeze()
+        
         ligand_x, ligand_pos = self.featurizer.get_fragment_features(fragment=self.seed, 
                                                                     embed_hydrogens=self.embed_hydrogens,
                                                                     center_pos=center_pos)
@@ -709,6 +723,7 @@ class BatchEnv():
               complexes: list[Complex],
               seeds: list[Fragment],
               initial_scores: list[float],
+              absolute_scores: list[float] = None,
               scorer: VinaScore = None,
               seed_i: int = None) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
@@ -737,6 +752,7 @@ class BatchEnv():
         #                     ligands=native_ligands_h)
         
         self.current_scores = initial_scores
+        self.absolute_scores = absolute_scores
         
         return batch_info
     
@@ -749,10 +765,10 @@ class BatchEnv():
             masks.append(valid_action_mask)
         masks = torch.stack(masks)
         non_terminated = [not terminated for terminated in self.terminateds]
-        try:
-            assert masks.size()[0] == sum(non_terminated)
-        except:
-            import pdb;pdb.set_trace()
+        # try:
+        #     assert masks.size()[0] == sum(non_terminated)
+        # except:
+        #     import pdb;pdb.set_trace()
         return masks
     
     
@@ -826,16 +842,49 @@ class BatchEnv():
         
         # import time
         # st = time.time()
-        vina_cli = VinaCLI()
-        receptor_paths = [env.complex.vina_protein.pdbqt_filepath 
-                          for env in self.envs]
-        native_ligands = [env.complex.ligand 
-                          for env in self.envs]
-        scores = vina_cli.get(receptor_paths=receptor_paths,
-                            native_ligands=native_ligands,
-                            ligands=mols)
+        
+        # Compute Vina score
+        if self.absolute_scores is None:
+        
+            vina_cli = VinaCLI()
+            receptor_paths = [env.complex.vina_protein.pdbqt_filepath 
+                            for env in self.envs]
+            native_ligands = [env.complex.ligand 
+                            for env in self.envs]
+            scores = vina_cli.get(receptor_paths=receptor_paths,
+                                native_ligands=native_ligands,
+                                ligands=mols)
+            
+        # Take already computed scores
+        else:
+            masks = self.get_valid_action_mask()
+            scores = []
+            for mask, absolute_scores, action_tensor in zip(masks, self.absolute_scores, frag_actions):
+                
+                try:
+                    non_zero_idx = torch.nonzero(mask).squeeze() # get list of index with valid action
+                    valid_idx = (non_zero_idx == action_tensor.item()).nonzero(as_tuple=True)[0]
+                
+                # d = {}
+                # n = 0
+                # for i, value in enumerate(mask):
+                #     if value:
+                #         d[i] = n
+                #         n += 1
+                
+                    # valid_idx = d[action_tensor.item()]
+                    score = absolute_scores[valid_idx]
+                    scores.append(score)
+                    self.absolute_scores = None # Only works for the first step, was not made for RL
+                except Exception as e:
+                    print(e)
+                    import pdb;pdb.set_trace()
+            
+                # valid_idx = [d[i.item()] for i in frag_actions]
+                # scores = [self.absolute_scores[i] for i in valid_idx]
+        
         relative_scores = [new_score - previous_score 
-                           for new_score, previous_score in zip(scores, self.current_scores)]
+                        for new_score, previous_score in zip(scores, self.current_scores)]
         batch_rewards = [-score for score in relative_scores]
         
         self.current_scores = scores

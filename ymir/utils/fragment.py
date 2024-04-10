@@ -78,11 +78,32 @@ def get_max_num_neighbor_from_original(atom_id: int,
         return None
     
     
+def get_no_attach_mapping(atom_idxs: list[int],
+                          mol: Mol):
+    n_atoms = mol.GetNumAtoms()
+    return [i for i in atom_idxs if i < n_atoms]
+    
+    
 def get_fragments_from_mol(mol: Mol) -> list[Fragment]:
     pieces = Chem.BRICS.BreakBRICSBonds(mol)
-    frags = Chem.GetMolFrags(pieces, asMols=True)
-    fragments = [Fragment(mol) for mol in frags]
-    return fragments
+    frags_mol_atom_mapping = []
+    frags = Chem.GetMolFrags(pieces, asMols=True, fragsMolAtomMapping=frags_mol_atom_mapping)
+
+    no_attach_mappings = []
+    for mapping in frags_mol_atom_mapping:
+        no_attach_mappings.append(get_no_attach_mapping(mapping, mol))
+    
+    # get canonical order
+    min_idxs = []
+    for mapping in frags_mol_atom_mapping:
+        min_idx = min(mapping)
+        min_idxs.append(min_idx)
+        
+    sort_idx = np.argsort(min_idxs)
+    fragments = [Fragment(frags[i]) for i in sort_idx]
+    frags_mol_atom_mapping = [no_attach_mappings[i] for i in sort_idx]
+    
+    return fragments, frags_mol_atom_mapping
 
 
 def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
@@ -90,7 +111,7 @@ def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
     unique_fragments = []
     all_smiles = []
     for mol in mols:
-        fragments = get_fragments_from_mol(mol)
+        fragments, frags_mol_atom_mapping = get_fragments_from_mol(mol)
         if len(fragments) > 1:
             for i, frag in enumerate(fragments):
                 attach_points = frag.get_attach_points()
@@ -107,76 +128,56 @@ def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
     return unique_fragments
 
 
-def get_construct(ligand: Mol,
-                removed_fragment: Fragment) -> Fragment:
-    
-    ligand_positions = ligand.GetConformer().GetPositions()
-    fragment_positions = removed_fragment.GetConformer().GetPositions()
-    fragment_aps = removed_fragment.get_attach_points()
-    fragment_ap_idx = list(fragment_aps.keys())[0]
-    fragment_ap_atom = removed_fragment.GetAtomWithIdx(fragment_ap_idx)
-    fragment_ap_neighbors = fragment_ap_atom.GetNeighbors()
-    assert len(fragment_ap_neighbors) == 1
-    fragment_neigh_idx = fragment_ap_neighbors[0].GetIdx()
-    
-    from scipy.spatial.distance import cdist
-    distance_matrix = cdist(fragment_positions, ligand_positions)
-    min_dists_idx = distance_matrix.argmin(axis=1)
-    
-    ligand_ap_idx = int(min_dists_idx[fragment_ap_idx])
-    ligand_neigh_idx = int(min_dists_idx[fragment_neigh_idx])
-    
-    brics_bonds = Chem.BRICS.FindBRICSBonds(ligand)
-    broken = False
-    for bond in brics_bonds:
-        t_bond, t_labels = bond
-        t1 = (ligand_ap_idx, ligand_neigh_idx)
-        t2 = (ligand_neigh_idx, ligand_ap_idx)
-        if t_bond == t1 or t_bond == t2 :
-            new_mol = Chem.BRICS.BreakBRICSBonds(ligand, bonds=[bond])
-            broken = True
-            break
-    if not broken:
-        import pdb;pdb.set_trace()
-    
-    new_frags = Chem.GetMolFrags(new_mol, asMols=True)
-    assert len(new_frags) == 2
-    frag1, frag2 = new_frags
-    if Chem.MolToSmiles(frag1) == Chem.MolToSmiles(removed_fragment):
-        construct = Fragment(frag2)
-    else:
-        if Chem.MolToSmiles(frag2) != Chem.MolToSmiles(removed_fragment):
-            if Chem.MolToSmiles(frag1, isomericSmiles=False) == Chem.MolToSmiles(removed_fragment, isomericSmiles=False):
-                construct = Fragment(frag2)
-            else:
-                if Chem.MolToSmiles(frag2, isomericSmiles=False) != Chem.MolToSmiles(removed_fragment, isomericSmiles=False):
-                    import pdb;pdb.set_trace()
-        # assert Chem.MolToSmiles(frag2) == Chem.MolToSmiles(self.removed_fragment)
-                construct = Fragment(frag1)
-        else:
-            construct = Fragment(frag1)
-            
-    return construct
-
-
 class ConstructionSeed(NamedTuple): 
-    construct: Fragment
-    removed_fragment: Fragment
+    ligand: Mol
+    removed_fragment_atom_idxs: list[int]
+    
+    
+    def decompose(self):
+        brics_bonds = Chem.BRICS.FindBRICSBonds(self.ligand)
+        broken = False
+        for bond in brics_bonds:
+            t_bond, t_labels = bond
+            if (t_bond[0] in self.removed_fragment_atom_idxs) or (t_bond[1] in self.removed_fragment_atom_idxs):
+                new_mol = Chem.BRICS.BreakBRICSBonds(self.ligand, bonds=[bond])
+                broken = True
+                break
+        if not broken:
+            import pdb;pdb.set_trace()
+        
+        frags_mol_atom_mapping = []
+        new_frags = Chem.GetMolFrags(new_mol, asMols=True, fragsMolAtomMapping=frags_mol_atom_mapping)
+        frags_mol_atom_mapping = [get_no_attach_mapping(mapping, self.ligand) for mapping in frags_mol_atom_mapping]
+        assert len(new_frags) == 2
+        frag1, frag2 = new_frags
+        if self.removed_fragment_atom_idxs == frags_mol_atom_mapping[0]:
+            construct = Fragment(frag2)
+            removed_fragment = Fragment(frag1)
+        elif self.removed_fragment_atom_idxs == frags_mol_atom_mapping[1]:
+            construct = Fragment(frag1)
+            removed_fragment = Fragment(frag2)
+        else:
+            import pdb;pdb.set_trace()
+            
+        return construct, removed_fragment, bond
 
 
 def get_seeds(ligand: Mol) -> list[ConstructionSeed]:
-    fragments = get_fragments_from_mol(ligand)
+    fragments, frags_mol_atom_mapping = get_fragments_from_mol(ligand)
     
     fragments_1ap: list[Fragment] = []
-    for fragment in fragments:
+    fragments_idxs: list[int] = []
+    for frag_i, fragment in enumerate(fragments):
         aps = fragment.get_attach_points()
         if len(aps) == 1:
             fragments_1ap.append(fragment)
+            fragments_idxs.append(frag_i)
             
     seeds = []
-    for removed_fragment in fragments_1ap :
-        construct = get_construct(ligand, removed_fragment)
-        construction_seed = ConstructionSeed(construct, removed_fragment)
+    for frag_i in fragments_idxs :
+        removed_fragment_atom_idxs = frags_mol_atom_mapping[frag_i]
+        construction_seed = ConstructionSeed(ligand,
+                                             removed_fragment_atom_idxs)
         seeds.append(construction_seed)
             
     return seeds
@@ -184,34 +185,64 @@ def get_seeds(ligand: Mol) -> list[ConstructionSeed]:
 
 # Align the attach point ---> neighbor vector to the x axis: (0,0,0) ---> (1,0,0)
 # Then translate such that the neighbor is (0,0,0)
-def center_fragments(protected_fragments: list[Fragment]):
+def center_fragments(protected_fragments: list[Fragment],
+                     attach_to_neighbor: bool = True,
+                     neighbor_is_zero: bool = True,
+                     ) -> list[list[Union[np.ndarray, Rotation]]]:
+    all_transformations = []
     for fragment in protected_fragments:
-        for atom in fragment.GetAtoms():
-            if atom.GetAtomicNum() == 0:
-                attach_point = atom
-                break
-        neighbor = attach_point.GetNeighbors()[0]
-        neighbor_id = neighbor.GetIdx()
-        attach_id = attach_point.GetIdx()
-        positions = fragment.GetConformer().GetPositions()
-        # neighbor_attach = positions[[neighbor_id, attach_id]]
-        # distance = euclidean(neighbor_attach[0], neighbor_attach[1])
-        # x_axis_vector = np.array([[0,0,0], [distance,0,0]])
-        neighbor_pos = positions[neighbor_id]
-        attach_pos = positions[attach_id]
-        attach_neighbor = neighbor_pos - attach_pos
-        distance = euclidean(neighbor_pos, attach_pos)
-        x_axis_vector = np.array([distance, 0, 0])
-        # import pdb;pdb.set_trace()
-        rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=attach_neighbor.reshape(-1, 3))
-        rotate_conformer(conformer=fragment.GetConformer(),
-                            rotation=rotation)
+        transformations = center_fragment(fragment,
+                                          attach_to_neighbor,
+                                          neighbor_is_zero)
+        all_transformations.append(transformations)
         
-        positions = fragment.GetConformer().GetPositions()
+    return all_transformations
+        
+       
+# Align the attach point ---> neighbor vector to the x axis: (0,0,0) ---> (1,0,0), if attach_to_neighbor
+# Else, neighbor ---> attach is the x axis.
+# Then translate such that the neighbor is (0,0,0) if neighbor_is_zero
+# Else the attach is the centre
+def center_fragment(fragment: Fragment,
+                    attach_to_neighbor: bool = True,
+                    neighbor_is_zero: bool = True) -> list[Union[np.ndarray, Rotation]]:
+    assert len(fragment.get_attach_points()) == 1
+    for atom in fragment.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            attach_point = atom
+            break
+    neighbor = attach_point.GetNeighbors()[0]
+    neighbor_id = neighbor.GetIdx()
+    attach_id = attach_point.GetIdx()
+    positions = fragment.GetConformer().GetPositions()
+    # neighbor_attach = positions[[neighbor_id, attach_id]]
+    # distance = euclidean(neighbor_attach[0], neighbor_attach[1])
+    # x_axis_vector = np.array([[0,0,0], [distance,0,0]])
+    neighbor_pos = positions[neighbor_id]
+    attach_pos = positions[attach_id]
+    if attach_to_neighbor:
+        direction = neighbor_pos - attach_pos
+    else:
+        direction = attach_pos - neighbor_pos
+    distance = euclidean(neighbor_pos, attach_pos)
+    x_axis_vector = np.array([distance, 0, 0])
+    # import pdb;pdb.set_trace()
+    rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=direction.reshape(-1, 3))
+    rotate_conformer(conformer=fragment.GetConformer(),
+                        rotation=rotation)
+    
+    positions = fragment.GetConformer().GetPositions()
+    if neighbor_is_zero:
         neighbor_pos = positions[neighbor_id]
         translation = -neighbor_pos
-        translate_conformer(conformer=fragment.GetConformer(),
-                            translation=translation)
+    else:
+        attach_pos = positions[attach_id]
+        translation = -attach_pos
+    translate_conformer(conformer=fragment.GetConformer(),
+                        translation=translation)
+    
+    transformations = [rotation, translation]
+    return transformations
 
 
 def get_masks(final_fragments: list[Fragment]):

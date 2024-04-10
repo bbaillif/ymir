@@ -3,6 +3,8 @@ import torch
 import random
 import numpy as np
 import logging
+import pickle
+import os
 # import wandb
 
 from torch import nn
@@ -32,7 +34,8 @@ from ymir.policy import Agent, Action
 from ymir.data import Fragment
 from ymir.params import (EMBED_HYDROGENS, 
                          HIDDEN_IRREPS,
-                         SEED)
+                         SEED,
+                         VINA_DATASET_PATH)
 from ymir.metrics.activity import VinaScore, VinaScorer
 from ymir.metrics.activity.vina_cli import VinaCLI
 
@@ -52,11 +55,11 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 24 # we will have protein envs in parallel
+n_envs = 128 # we will have protein envs in parallel
 batch_size = min(n_envs, 32) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 n_epochs = 5 # number of times we update the network per episode
-lr = 1e-4
+lr = 1e-6
 gamma = 0.95 # discount factor for rewards
 gae_lambda = 0.95 # lambda factor for GAE
 device = torch.device('cuda')
@@ -65,7 +68,7 @@ ent_coef = 0.05
 vf_coef = 0.5
 max_grad_value = 0.5
 
-n_complexes = 50
+n_complexes = 200
 use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
@@ -87,121 +90,164 @@ writer = SummaryWriter(f"logs/{experiment_name}")
 
 removeHs = not EMBED_HYDROGENS
 fragment_library = FragmentLibrary(removeHs=removeHs)
-ligands = fragment_library.ligands
-protected_fragments = fragment_library.protected_fragments
+# ligands = fragment_library.ligands
+# protected_fragments = fragment_library.protected_fragments
 
-ligands = [ligand 
-           for ligand in ligands 
-           if ligand.GetNumHeavyAtoms() < 50]
+# ligands = [ligand 
+#            for ligand in ligands 
+#            if ligand.GetNumHeavyAtoms() < 50]
 
-random.shuffle(ligands)
+# random.shuffle(ligands)
 
 z_list = [0, 6, 7, 8, 16, 17]
 if EMBED_HYDROGENS:
     z_list.append(1)
 z_table = AtomicNumberTable(zs=z_list)
 # Remove ligands having at least one heavy atom not in list
-ligands = select_mol_with_symbols(ligands,
-                                  z_list)
+# ligands = select_mol_with_symbols(ligands,
+#                                   z_list)
 
-# Remove fragment having at least one heavy atom not in list
-protected_fragments = select_mol_with_symbols(protected_fragments,
-                                              z_list)
+# # Remove fragment having at least one heavy atom not in list
+# protected_fragments = select_mol_with_symbols(protected_fragments,
+#                                               z_list)
 
 # Select only fragments with less than 3 attach points
-n_attaches = []
-for fragment in protected_fragments:
-    frag_copy = Fragment(mol=fragment,
-                         protections=fragment.protections)
-    frag_copy.unprotect()
-    attach_points = frag_copy.get_attach_points()
-    n_attach = len(attach_points)
-    n_attaches.append(n_attach)
+# n_attaches = []
+# for fragment in protected_fragments:
+#     frag_copy = Fragment(mol=fragment,
+#                          protections=fragment.protections)
+#     frag_copy.unprotect()
+#     attach_points = frag_copy.get_attach_points()
+#     n_attach = len(attach_points)
+#     n_attaches.append(n_attach)
 
-protected_fragments = [fragment 
-                       for fragment, n in zip(protected_fragments, n_attaches)
-                       if n == 1]
+# protected_fragments = [fragment 
+#                        for fragment, n in zip(protected_fragments, n_attaches)
+#                        if n == 1]
            
-unique_fragments = []
-unique_smiles = []
-for mol in protected_fragments:
-    smiles = Chem.MolToSmiles(mol)
-    if not smiles in unique_smiles:
-        unique_smiles.append(smiles)
-        unique_fragments.append(mol)
+# unique_fragments = []
+# unique_smiles = []
+# for mol in protected_fragments:
+#     smiles = Chem.MolToSmiles(mol)
+#     if not smiles in unique_smiles:
+#         unique_smiles.append(smiles)
+#         unique_fragments.append(mol)
         
-protected_fragments = unique_fragments
+# protected_fragments = unique_fragments
            
 # TO CHANGE/REMOVE
 # random.shuffle(protected_fragments)
 # n_fragments = 100
 # protected_fragments = protected_fragments[:n_fragments]
 # protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
-protected_fragments_smiles = unique_smiles
 
-protein_paths = []
-for ligand in ligands:
-    pdb_id = ligand.GetProp('PDB_ID')
-    protein_path, _ = fragment_library.pdbbind.get_pdb_id_pathes(pdb_id)
-    protein_paths.append(protein_path)
+# Remove ligands having at least one heavy atom not in list
+ligands = fragment_library.get_restricted_ligands(z_list)
+
+# Remove fragment having at least one heavy atom not in list
+protected_fragments = fragment_library.get_restricted_fragments(z_list)
+           
+protected_fragments_smiles = [Chem.MolToSmiles(frag) for frag in protected_fragments]
+
+# with open(VINA_DATASET_PATH, 'rb') as f:
+#     dataset = pickle.load(f)
+
+dataset_path = '/home/bb596/hdd/ymir/dataset/'
+data_filenames = os.listdir(dataset_path)
+
+all_seeds = []
+all_constructs = []
+complexes = []
+all_scores = []
+native_scores = []
+for data_filename in data_filenames:
     
-assert len(ligands) == len(protein_paths)
+    data_filepath = os.path.join(dataset_path, data_filename)
+    with open(data_filepath, 'rb') as f:
+        data = pickle.load(f)
+    
+    protein_path = data['protein_path']
+    protein_path = protein_path.replace('.pdbqt', '.pdb')
+    ligand = data['ligand']
+    removed_fragment_atom_idxs = data['removed_fragment_atom_idxs']
+    absolute_scores = data['absolute_scores']
+    native_score = data['native_score']
+    
+    seed = ConstructionSeed(ligand, removed_fragment_atom_idxs)
+    complx = Complex(ligand, protein_path)
 
-logging.info('Loading complexes')
+    construct, removed_fragment, bond = seed.decompose()
+
+    all_seeds.append(seed)
+    all_constructs.append(construct)
+    complexes.append(complx)
+    all_scores.append(absolute_scores)
+    native_scores.append(native_score)
+    
+    
+# protein_paths = []
+# for ligand in ligands:
+#     pdb_id = ligand.GetProp('PDB_ID')
+#     protein_path, _ = fragment_library.pdbbind.get_pdb_id_pathes(pdb_id)
+#     protein_paths.append(protein_path)
+    
+# assert len(ligands) == len(protein_paths)
+
+# logging.info('Loading complexes')
 
 # Get complexes with a correct Vina setup, and having a one-attach-point fragment in our list
-not_working_protein = []
-complexes: list[Complex] = []
-seed_to_complex: list[int] = []
-all_seeds: list[ConstructionSeed] = []
-complex_counter = 0
-for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_paths)):
+# not_working_protein = []
+# complexes: list[Complex] = []
+# seed_to_complex: list[int] = []
+# all_seeds: list[ConstructionSeed] = []
+# complex_counter = 0
+# for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_paths)):
     
-    seeds = get_seeds(ligand)
-    correct_seeds = []
-    for seed in seeds:
-        construct, removed_fragment = seed
-        attach_points = construct.get_attach_points()
-        assert len(attach_points) == 1
-        if 7 in attach_points.values():
-            continue
+#     seeds = get_seeds(ligand)
+#     correct_seeds = []
+#     for seed in seeds:
+#         construct, removed_fragment = seed
+#         attach_points = construct.get_attach_points()
+#         assert len(attach_points) == 1
+#         if 7 in attach_points.values():
+#             continue
         
-        frag_smiles = Chem.MolToSmiles(removed_fragment)
-        if frag_smiles in protected_fragments_smiles:
-            correct_seeds.append(seed)
+#         frag_smiles = Chem.MolToSmiles(removed_fragment)
+#         if frag_smiles in protected_fragments_smiles:
+#             correct_seeds.append(seed)
     
-    if len(correct_seeds) > 0:
-        try:
-            complx = Complex(ligand, protein_path)
-            # vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
-            vina_protein = complx.vina_protein
-            pocket = complx.pocket # Detect the short pocket situations
+#     if len(correct_seeds) > 0:
+#         try:
+#             complx = Complex(ligand, protein_path)
+#             # vina_scorer = VinaScorer(complx.vina_protein) # Generate the Vina protein file
+#             vina_protein = complx.vina_protein
+#             pocket = complx.pocket # Detect the short pocket situations
             
-        except Exception as e:
-            logging.warning(f'Error on {protein_path}: {e}')
-            not_working_protein.append(protein_path)
+#         except Exception as e:
+#             logging.warning(f'Error on {protein_path}: {e}')
+#             not_working_protein.append(protein_path)
             
-        else:
-            complexes.append(complx)
-            for seed in correct_seeds:
-                all_seeds.append(seed)
-                seed_to_complex.append(complex_counter)
-            complex_counter += 1
+#         else:
+#             complexes.append(complx)
+#             for seed in correct_seeds:
+#                 all_seeds.append(seed)
+#                 seed_to_complex.append(complex_counter)
+#             complex_counter += 1
             
-            # TO REMOVE IN FINAL
-            if complex_counter == n_complexes:
-                break
+#             # TO REMOVE IN FINAL
+#             if complex_counter == n_complexes:
+#                 break
          
-vina_cli = VinaCLI()
-receptor_paths = [complex.vina_protein.pdbqt_filepath 
-                    for complex in complexes]
-native_ligands = [complex.ligand 
-                    for complex in complexes]
-native_ligands_h = [Chem.AddHs(mol, addCoords=True) 
-                    for mol in native_ligands]
-native_scores = vina_cli.get(receptor_paths=receptor_paths,
-                    native_ligands=native_ligands,
-                    ligands=native_ligands_h)
+# vina_cli = VinaCLI()
+# receptor_paths = [complex.vina_protein.pdbqt_filepath 
+#                     for complex in complexes]
+# native_ligands = [complex.ligand 
+#                     for complex in complexes]
+# native_ligands_h = [Chem.AddHs(mol, addCoords=True) 
+#                     for mol in native_ligands]
+# native_scores = vina_cli.get(receptor_paths=receptor_paths,
+#                     native_ligands=native_ligands,
+#                     ligands=native_ligands_h)
             
 n_seeds = len(all_seeds)
 
@@ -224,7 +270,8 @@ batch_env = BatchEnv(envs,
                      memory)
 
 agent = Agent(protected_fragments=final_fragments,
-              atomic_num_table=z_table)
+              atomic_num_table=z_table,
+              features_dim=envs[0].soap.get_number_of_features())
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_28_02_2024_18_20_19_8000.pt')
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_29_02_2024_00_42_18_18000.pt')
 
@@ -254,10 +301,14 @@ try:
         logging.info(seed_idxs)
         
         current_seeds = [all_seeds[seed_i] for seed_i in seed_idxs]
-        current_constructs = [seed.construct for seed in current_seeds]
-        complex_idxs = [seed_to_complex[seed_i] for seed_i in seed_idxs]
-        current_complexes = [complexes[idx] for idx in complex_idxs]
-        current_scores = [native_scores[idx] for idx in complex_idxs]
+        current_constructs = [all_constructs[seed_i] for seed_i in seed_idxs]
+        current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
+        current_absolute_scores = [all_scores[seed_i] for seed_i in seed_idxs]
+        current_native_scores = [native_scores[seed_i] for seed_i in seed_idxs]
+        # current_constructs = [seed.construct for seed in current_seeds]
+        # complex_idxs = [seed_to_complex[seed_i] for seed_i in seed_idxs]
+        # current_complexes = [complexes[idx] for idx in complex_idxs]
+        # current_scores = [native_scores[idx] for idx in complex_idxs]
         
         # complx = current_complexes[0]
         # vina_scorer = VinaScorer(complx.vina_protein)
@@ -266,7 +317,8 @@ try:
         
         next_info = batch_env.reset(current_complexes,
                                     current_constructs,
-                                    initial_scores=current_scores
+                                    initial_scores=current_native_scores,
+                                    absolute_scores=current_absolute_scores,
                                     # vina_score,
                                     # seed_i
                                     )
@@ -299,17 +351,13 @@ try:
             masks.append(current_masks)
             
             with torch.no_grad():
-                x = Batch.from_data_list(data_list=current_obs)
-                x.to(device)
-                features = agent.extract_features(x)
+                features = torch.tensor(np.array(current_obs), device=device, dtype=torch.float)
                 current_masks = current_masks.to(device)
                 current_action: Action = agent.get_action(features,
-                                                          batch=x.batch,
                                                             masks=current_masks)
                 current_frag_actions = current_action.frag_i.cpu()
                 current_frag_logprobs = current_action.frag_logprob.cpu()
-                current_values = agent.get_value(features,
-                                                 batch=x.batch)
+                current_values = agent.get_value(features)
                 # current_values = current_values.squeeze(dim=-1)
                 
             frag_actions.append(current_frag_actions)
@@ -422,14 +470,11 @@ try:
                     mb_frag_actions = b_frag_actions[minibatch_inds]
                     mb_masks = b_masks[minibatch_inds]
                     
-                    x = Batch.from_data_list(mb_obs)
-                    x = x.to(device)
-                    features = agent.extract_features(x)
+                    features = torch.tensor(np.array(mb_obs), device=device, dtype=torch.float)
                     
                     current_masks = mb_masks.to(device)
                     current_frag_actions = mb_frag_actions.to(device)
                     current_action = agent.get_action(features=features,
-                                                      batch=x.batch,
                                                         masks=current_masks,
                                                         frag_actions=current_frag_actions)
                     
@@ -453,8 +498,7 @@ try:
                     mb_values = b_values[minibatch_inds]
                     mb_returns = mb_returns.to(device)
                     mb_values = mb_values.to(device)
-                    current_values = agent.get_value(features=features,
-                                                     batch=x.batch)
+                    current_values = agent.get_value(features=features)
                     v_loss_unclipped = ((current_values - mb_returns) ** 2)
                     v_clipped = mb_values + torch.clamp(current_values - mb_values, 
                                                         -clip_coef, 
@@ -513,6 +557,7 @@ except KeyboardInterrupt:
 except Exception as e:
     print(e)
     import pdb;pdb.set_trace()
+    print(e)
         
 # agent = Agent(*args, **kwargs)
 # agent.load_state_dict(torch.load(PATH))
