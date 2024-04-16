@@ -14,9 +14,10 @@ from abc import abstractclassmethod
 from ymir.params import FEATURES_DIM
 from torch_geometric.utils import unbatch
 from torch_scatter import scatter_mean, scatter_add
+from torch import nn
 
 
-class AtomisticNNModel():
+class AtomisticNNModel(nn.Module):
     """
     Uses an atomistic neural network (NN) as a model to process an input conformation 
     to obtain a predicted value. In current work, we try to predict the ARMSD to 
@@ -37,6 +38,7 @@ class AtomisticNNModel():
                  device: torch.device = torch.device('cuda'),
                 #  action_dim: int
                  ):
+        super().__init__()
         self.config = config
         self.atomistic_nn = atomistic_nn
         self.device = device

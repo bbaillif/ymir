@@ -8,14 +8,13 @@ from e3nn.math import (soft_one_hot_linspace,
 from e3nn import o3
 from e3nn.nn import FullyConnectedNet
 from torch_geometric.data import Batch
-from ymir.params import CNN_RADIUS, N_INTERACTION_BLOCKS
+from ymir.params import (CNN_RADIUS, N_INTERACTION_BLOCKS, L_MAX,
+                         NUMBER_OF_BASIS,
+                         MOL_ID_EMBEDDING_SIZE,
+                        NODE_Z_EMBEDDING_SIZE,
+                        MIDDLE_LAYER_SIZE,
+                        MAX_NUMBER_TYPES)
 
-L_MAX = 3
-NUMBER_OF_BASIS = 10
-MOL_ID_EMBEDDING_SIZE = 16
-NODE_Z_EMBEDDING_SIZE = 64 - MOL_ID_EMBEDDING_SIZE
-MIDDLE_LAYER_SIZE = 32
-MAX_NUMBER_TYPES = 100
 
 class InteractionBlock(torch.nn.Module):
     
@@ -136,38 +135,44 @@ class CNN(torch.nn.Module):
         pos = batch.pos
         mol_id = batch.mol_id
         
-        edge_src, edge_dst = radius_graph(pos, 
-                                          self.max_radius,
-                                          batch=batch.batch)
-        
-        # import pdb;pdb.set_trace()
-        
-        num_nodes = len(batch.x)
-        avg_num_neighbors = len(edge_src) / num_nodes
-        
-        # import pdb;pdb.set_trace()
-        
         x = self.node_z_embedder(x)
         mol_id = self.node_mol_embedder(mol_id)
         
         x = torch.cat([x, mol_id], dim=-1)
-
-        edge_vec = pos[edge_dst] - pos[edge_src]
-        edge_length = edge_vec.norm(dim=1)
-
-        edge_length_embedded = soft_one_hot_linspace(
-            x=edge_length,
-            start=0.0,
-            end=self.max_radius,
-            number=self.number_of_basis,
-            basis='smooth_finite',
-            cutoff=True
-        )
-        edge_length_embedded = edge_length_embedded.mul(self.number_of_basis**0.5)
-
-        edge_sh = self.sh(edge_vec)
         
-        for interaction_block in self.interaction_blocks:
+        for block_i, interaction_block in enumerate(self.interaction_blocks):
+            
+            if block_i == 0:
+                radius = 3
+            else:
+                radius = self.max_radius
+            
+            edge_src, edge_dst = radius_graph(pos, 
+                                          radius,
+                                          batch=batch.batch)
+        
+            # import pdb;pdb.set_trace()
+            
+            num_nodes = len(batch.x)
+            avg_num_neighbors = len(edge_src) / num_nodes
+            
+            # import pdb;pdb.set_trace()
+
+            edge_vec = pos[edge_dst] - pos[edge_src]
+            edge_length = edge_vec.norm(dim=1)
+
+            edge_length_embedded = soft_one_hot_linspace(
+                x=edge_length,
+                start=0.0,
+                end=radius,
+                number=self.number_of_basis,
+                basis='smooth_finite',
+                cutoff=True
+            )
+            edge_length_embedded = edge_length_embedded.mul(self.number_of_basis**0.5)
+
+            edge_sh = self.sh(edge_vec)
+            
             x = interaction_block.forward(x,
                                           edge_sh,
                                           edge_length_embedded,
@@ -175,12 +180,16 @@ class CNN(torch.nn.Module):
                                           edge_dst,
                                           avg_num_neighbors)
             
-        return x
+        # return x
             
-        output = scatter(x,
-                         batch.batch,
-                         dim=0,
-                         reduce='mean')
+        # output = scatter(x,
+        #                  batch.batch,
+        #                  dim=0,
+        #                  reduce='mean')
+        
+        is_attach = batch.x == 0
+        output = x[is_attach]
+        # assert output.shape[0] == batch.batch.max() + 1
         
         # rot = o3.rand_matrix().to(pos)
         # pos_r = batch.pos @ rot.T

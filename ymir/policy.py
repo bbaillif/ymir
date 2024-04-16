@@ -6,7 +6,7 @@ from e3nn import o3
 from ymir.distribution import CategoricalMasked
 from typing import NamedTuple
 from ymir.params import (EMBED_HYDROGENS, 
-                         LMAX, 
+                         L_MAX, 
                          HIDDEN_IRREPS,
                          IRREPS_OUTPUT)
 from ymir.atomic_num_table import AtomicNumberTable
@@ -84,36 +84,55 @@ class Agent(nn.Module):
     def __init__(self, 
                  protected_fragments: list[Fragment],
                  atomic_num_table: AtomicNumberTable,
-                 features_dim: int,
+                #  features_dim: int,
                  hidden_irreps: o3.Irreps = HIDDEN_IRREPS,
                  irreps_output: o3.Irreps = IRREPS_OUTPUT,
-                 lmax: int = LMAX,
+                #  lmax: int = L_MAX,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
         self.z_table = atomic_num_table
-        self.features_dim = features_dim
+        # self.features_dim = features_dim
         self.hidden_irreps = hidden_irreps
         self.irreps_output = irreps_output
-        self.lmax = lmax
+        # self.lmax = lmax
         self.device = device
         self.embed_hydrogens = embed_hydrogens
         
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
         
-        hidden_dims = [self.features_dim * 2, 
-                       self.features_dim,
-                       self.features_dim // 2]
-        self.actor = MultiLinear(input_dim=self.features_dim, 
+        self.pocket_feature_extractor = CNN(hidden_irreps=self.hidden_irreps,
+                                            irreps_output=self.irreps_output,
+                                             num_elements=len(self.z_table))
+        
+        assert(len(self.irreps_output) == 1) # only invariant features
+        self.inv_features_dim = self.irreps_output.dim
+        hidden_dims = [self.inv_features_dim * 2, 
+                    #    self.inv_features_dim, 
+                    #    self.inv_features_dim // 2
+                       ]
+        self.actor = MultiLinear(input_dim=self.inv_features_dim, 
                                  hidden_dims=hidden_dims,
                                  output_dim=self.action_dim)
         
-        self.critic = MultiLinear(input_dim=self.features_dim, 
+        self.critic = MultiLinear(input_dim=self.inv_features_dim, 
                                  hidden_dims=hidden_dims,
                                  output_dim=1)
+        
+        
+        # hidden_dims = [self.features_dim * 2, 
+        #                self.features_dim,
+        #                self.features_dim // 2]
+        # self.actor = MultiLinear(input_dim=self.features_dim, 
+        #                          hidden_dims=hidden_dims,
+        #                          output_dim=self.action_dim)
+        
+        # self.critic = MultiLinear(input_dim=self.features_dim, 
+        #                          hidden_dims=hidden_dims,
+        #                          output_dim=1)
 
 
     def forward(self, 
@@ -123,6 +142,15 @@ class Agent(nn.Module):
         action = self.get_action(features, masks)
         value = self.get_value(features)
         return action, value
+    
+    
+    def extract_features(self,
+                         x: Batch):
+        # noise = torch.randn_like(x.pos) / 10 # variance of 0.1
+        # noise = noise.to(x.pos)
+        # x.pos = x.pos + noise
+        features = self.pocket_feature_extractor(x)
+        return features
     
 
     def get_action(self, 
@@ -137,7 +165,7 @@ class Agent(nn.Module):
         # frag_logits = frag_logits * 4 # from [-1;1] to [-3;3]
         # if 2000 fragments, the maximum prob will be exp(3) / (exp(-3) *700 + exp(3)) = 0.30
         # frag_logits = frag_logits - frag_logits.max(axis=1).values.reshape(-1, 1)
-        frag_logits = torch.clamp(frag_logits, -2, 2)
+        # frag_logits = torch.clamp(frag_logits, -2, 2)
         
         # Fragment sampling
         if torch.isnan(frag_logits).any():
