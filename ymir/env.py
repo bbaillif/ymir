@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import logging
 import io
+import os
 
 from rdkit import Chem
 from rdkit.Chem import Mol
@@ -25,8 +26,15 @@ from ymir.featurizer_sn import Featurizer
 from ymir.metrics.activity import VinaScore
 from ymir.bond_distance import MedianBondDistance
 from ymir.metrics.activity.vina_cli import VinaCLI
-from dscribe.descriptors import SOAP
-from sklearn.preprocessing import normalize
+from meeko import PDBQTMolecule
+from meeko import RDKitMolCreate
+from rdkit.Geometry import Point3D
+from ymir.pdbqt_reader import PDBQTReader
+from rdkit.Chem.rdFMCS import FindMCS
+from rdkit.Chem import rdDetermineBonds
+from rdkit.Chem import AllChem
+from scipy.spatial.distance import euclidean
+from ymir.complex_minimizer import ComplexMinimizer
 
 
 class FragmentBuilderEnv():
@@ -56,15 +64,6 @@ class FragmentBuilderEnv():
         self.geometry_extractor = GeometryExtractor()
         self.featurizer = Featurizer(z_table=self.z_table)
         self.mbd = MedianBondDistance()
-        
-        species = ['C', 'N', 'O', 'Cl', 'S']
-        if self.embed_hydrogens:
-            species = ['H'] + species
-        self.soap = SOAP(species=species,
-                        periodic=False,
-                        r_cut=8,
-                        n_max=8,
-                        l_max=6)
         
     @property
     def action_dim(self) -> int:
@@ -167,30 +166,31 @@ class FragmentBuilderEnv():
     
     def featurize_pocket(self) -> Data:
         center_pos = [0, 0, 0]
-        seed_copy = Fragment(self.seed, self.seed.protections)
-        seed_copy.protect()
-        seed_atoms = self.rdkit_to_ase(seed_copy)
-        pocket_atoms = self.rdkit_to_ase(self.pocket_mol)
-        if not self.embed_hydrogens:
-            seed_atoms = seed_atoms[[atom.index for atom in seed_atoms if atom.symbol != 'H']]
-            pocket_atoms = pocket_atoms[[atom.index for atom in pocket_atoms if atom.symbol != 'H']]
+        # seed_copy = Fragment(self.seed, self.seed.protections)
+        # seed_copy.protect()
+        # seed_atoms = self.rdkit_to_ase(seed_copy)
+        # pocket_atoms = self.rdkit_to_ase(self.pocket_mol)
+        # if not self.embed_hydrogens:
+        #     seed_atoms = seed_atoms[[atom.index for atom in seed_atoms if atom.symbol != 'H']]
+        #     pocket_atoms = pocket_atoms[[atom.index for atom in pocket_atoms if atom.symbol != 'H']]
         
-        total_atoms = seed_atoms + pocket_atoms
-        seed_soap = self.soap.create(total_atoms, centers=[center_pos])
+        # total_atoms = seed_atoms + pocket_atoms
+        # seed_soap = self.soap.create(total_atoms, centers=[center_pos])
 
-        seed_soap = normalize(seed_soap)
+        # seed_soap = normalize(seed_soap)
 
-        return seed_soap.squeeze()
+        # return seed_soap.squeeze()
         
-        ligand_x, ligand_pos = self.featurizer.get_fragment_features(fragment=self.seed, 
+        ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
                                                                     embed_hydrogens=self.embed_hydrogens,
                                                                     center_pos=center_pos)
-        protein_x, protein_pos = self.featurizer.get_mol_features(mol=self.pocket_mol,
+        protein_x, protein_pos, protein_focal = self.featurizer.get_mol_features(mol=self.pocket_mol,
                                                                 embed_hydrogens=self.embed_hydrogens,
                                                                 center_pos=center_pos)
         
         pocket_x = protein_x + ligand_x
         pocket_pos = protein_pos + ligand_pos
+        is_focal = protein_focal + ligand_focal
         
         mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
         
@@ -198,9 +198,12 @@ class FragmentBuilderEnv():
         x = torch.tensor(pocket_x, dtype=torch.long)
         pos = torch.tensor(pocket_pos, dtype=torch.float)
         mol_id = torch.tensor(mol_id, dtype=torch.long)
+        is_focal = torch.tensor(is_focal, dtype=torch.bool)
+        
         data = Data(x=x,
                     pos=pos,
-                    mol_id=mol_id
+                    mol_id=mol_id,
+                    is_focal=is_focal,
                     )
 
         return data
@@ -254,6 +257,8 @@ class FragmentBuilderEnv():
         if self.terminated: 
             import pdb;pdb.set_trace()
         
+        self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
+        
         # return observation, info
         return info
     
@@ -281,10 +286,6 @@ class FragmentBuilderEnv():
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
-        # REMOVE FOR MULTI-STEP RL
-        if not self.terminated:
-            import pdb;pdb.set_trace()
-        assert self.terminated, 'Something is wrong with the fragmentation code'
         reward = 0
         
         if n_actions == self.max_episode_steps: # not terminated but reaching max step size
@@ -293,16 +294,15 @@ class FragmentBuilderEnv():
             # all other attachment points are already protected
             self.seed.protect() 
         elif not self.terminated:
-            self.seed_to_frame()
             self.valid_action_mask = torch.tensor(self.get_valid_action_mask())
             
-            # we terminate the generation if there is no valid action (due to clash)
-            has_valid_action = torch.any(self.valid_action_mask)
-            self.terminated = not has_valid_action
-            if self.terminated:
-                logging.info('We have an environment with only clashing fragments')
-                self.seed.protect()
-                reward = -100 # it is actually a clash penalty
+            # # we terminate the generation if there is no valid action (due to clash)
+            # has_valid_action = torch.any(self.valid_action_mask)
+            # self.terminated = not has_valid_action
+            # if self.terminated:
+            #     logging.info('We have an environment with only clashing fragments')
+            #     self.seed.protect()
+            #     reward = -100 # it is actually a clash penalty
         
         if self.terminated or self.truncated:
             assert(all([atom.GetAtomicNum() > 0 for atom in self.seed.GetAtoms()]))
@@ -312,6 +312,21 @@ class FragmentBuilderEnv():
         
         # return observation, reward, self.terminated, self.truncated, info
         return reward, self.terminated, self.truncated, info
+    
+    
+    def set_seed_coordinates(self,
+                             pose_mol):
+        pose_conformer = pose_mol.GetConformer()
+        for transformation in self.transformations:
+            if isinstance(transformation, Rotation):
+                rotate_conformer(pose_conformer, transformation)
+            else:
+                translate_conformer(pose_conformer, transformation)
+        pose_coordinates = pose_conformer.GetPositions()
+        seed_conformer = self.seed.GetConformer()
+        for i, new_pos in enumerate(pose_coordinates):
+            point = Point3D(*new_pos)
+            seed_conformer.SetAtomPosition(i, point)
     
     
     def get_valid_action_mask(self):
@@ -675,11 +690,12 @@ class FragmentBuilderEnv():
     
     def get_clean_mol(self,
                       ligand: Mol):
-        frag = Fragment(ligand)
+        frag = Fragment(ligand, protections=ligand.protections)
         frag.protect()
         Chem.SanitizeMol(frag)
         mol = Chem.RemoveHs(frag)
         mol_h = Chem.AddHs(mol, addCoords=True)
+        # mol_h = Mol(frag)
         
         for transformation in reversed(self.transformations):
             if isinstance(transformation, Rotation):
@@ -710,6 +726,14 @@ class FragmentBuilderEnv():
         return new_mol
     
     
+    def get_minimized_mol(self):
+        mol = self.get_clean_mol(self.seed)
+        mini_mol = self.complex_minimizer.minimize_ligand(mol, 
+                                                        #   distance_constraint=1
+                                                          )
+        return mini_mol
+    
+    
 class BatchEnv():
     
     def __init__(self,
@@ -717,6 +741,8 @@ class BatchEnv():
                  memory: dict) -> None:
         self.envs = envs
         self.memory = memory
+        self.vina_cli = VinaCLI()
+        self.reader = PDBQTReader()
         
         
     def reset(self,
@@ -779,43 +805,6 @@ class BatchEnv():
         return ongoing_envs
     
     
-    def get_rewards(self,
-                    max_num_heavy_atoms: int = 50,
-                    clash_penalty: float = -10.0) -> list[float]:
-        
-        rewards = []
-        for env_i in self.ongoing_env_idxs:
-            env = self.envs[env_i]
-            terminated = self.terminateds[env_i]
-            mol = env.get_clean_mol(env.seed)
-            # n_clashes = env.complex.clash_detector.get([mol])
-            # n_clash = n_clashes[0]
-            has_clash = env.get_pocket_ligand_clash(ligand=env.seed)
-            if has_clash: # we penalize clash
-                reward = clash_penalty
-            elif terminated: # if no clash, we score the ligand is construction is finished
-                # scores = env.vina_score.get([mol])
-                scores = self.scorer.get([mol])
-                score = scores[0]
-                reward = - score # we want to maximize the reward, so minimize glide score
-                reward = reward * reward # we square the score to give higher importance to high scores
-                if score > 0: # penalize positive vina score
-                    reward = - reward
-            else: # construction is ongoing
-                reward = 0
-                
-            # Penality if more than X heavy atoms
-            n_atoms = mol.GetNumHeavyAtoms()
-            if n_atoms > max_num_heavy_atoms:
-                malus = n_atoms - max_num_heavy_atoms
-                reward = reward - malus
-            
-            rewards.append(reward)
-            
-        assert len(rewards) == len(self.ongoing_env_idxs)
-        return rewards
-            
-    
     def step(self,
              frag_actions: torch.Tensor,
              ) -> tuple[list[float], list[bool], list[bool], list[dict]]:
@@ -825,78 +814,107 @@ class BatchEnv():
         batch_truncated = []
         batch_info = []
         mols = []
-        old_batch_rewards = []
+        receptor_paths = []
+        native_ligands = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             frag_action = int(frag_action)
-            reward, terminated, truncated, info = env.step(frag_action)
+            _, terminated, truncated, info = env.step(frag_action)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
             
-            old_batch_rewards.append(reward)
             batch_truncated.append(truncated)
             batch_info.append(info)
             
-            mols.append(env.get_clean_mol(env.seed))
+            receptor_paths.append(env.complex.vina_protein.pdbqt_filepath)
+            native_ligands.append(env.complex.ligand)
+            mol = env.get_clean_mol(env.seed)
+            mols.append(mol)
+            # mini_mol = env.get_minimized_mol()
+            # import pdb;pdb.set_trace()
         
-        # import time
-        # st = time.time()
-        
-        # Compute Vina score
-        if self.absolute_scores is None:
-        
-            vina_cli = VinaCLI()
-            receptor_paths = [env.complex.vina_protein.pdbqt_filepath 
-                            for env in self.envs]
-            native_ligands = [env.complex.ligand 
-                            for env in self.envs]
-            scores = vina_cli.get(receptor_paths=receptor_paths,
-                                native_ligands=native_ligands,
-                                ligands=mols)
+        scores = self.vina_cli.get(receptor_paths=receptor_paths,
+                                    native_ligands=native_ligands,
+                                    ligands=mols)
             
-        # Take already computed scores
-        else:
-            masks = self.get_valid_action_mask()
-            scores = []
-            for mask, absolute_scores, action_tensor in zip(masks, self.absolute_scores, frag_actions):
-                
-                try:
-                    non_zero_idx = torch.nonzero(mask).squeeze() # get list of index with valid action
-                    valid_idx = (non_zero_idx == action_tensor.item()).nonzero(as_tuple=True)[0]
-                
-                # d = {}
-                # n = 0
-                # for i, value in enumerate(mask):
-                #     if value:
-                #         d[i] = n
-                #         n += 1
-                
-                    # valid_idx = d[action_tensor.item()]
-                    score = absolute_scores[valid_idx]
-                    scores.append(score)
-                    self.absolute_scores = None # Only works for the first step, was not made for RL
-                except Exception as e:
-                    print(e)
+        relative_scores = []
+        for env_i, new_score in zip(self.ongoing_env_idxs, scores):
+            previous_score = self.current_scores[env_i]
+            relative_score = new_score - previous_score
+            relative_scores.append(relative_score)
+            self.current_scores[env_i] = new_score
+            
+        for i, env_i in enumerate(self.ongoing_env_idxs):
+            env = self.envs[env_i]
+            pose_path = os.path.join(self.vina_cli.output_directory, f'Ligand_{i}_out.pdbqt')
+            # pdbqt_mol = PDBQTMolecule.from_file(pose_path, skip_typing=True)
+            
+            # try:
+            #     rdkitmol_list = RDKitMolCreate.from_pdbqt_mol(pdbqt_mol)
+            # except Exception as e:
+            #     print(e)
+            #     print(type(e))
+            #     import pdb;pdb.set_trace()
+            # pose_mol = rdkitmol_list[0]
+            # pose_mol = Chem.MolFromPDBFile(pose_path, sanitize=False, removeHs=False, proximityBonding=False)
+            # if pose_mol is None:
+            #     import pdb;pdb.set_trace()
+            # symbols, coords = self.reader.read(pose_path)
+            xyz_block = self.reader.to_xyz_block(pose_path)
+            pose_mol = Chem.MolFromXYZBlock(xyz_block)
+            if pose_mol is None:
+                import pdb;pdb.set_trace()
+            rdDetermineBonds.DetermineConnectivity(pose_mol)
+            seed_copy = Fragment(env.seed, env.seed.protections)
+            seed_copy.protect()
+            pose_mol = AllChem.AssignBondOrdersFromTemplate(seed_copy, pose_mol)
+            Chem.SanitizeMol(pose_mol)
+            Chem.SanitizeMol(seed_copy)
+            mcs = FindMCS([seed_copy, pose_mol])
+            if mcs.numAtoms != seed_copy.GetNumAtoms():
+                import pdb;pdb.set_trace()
+            seed_match = seed_copy.GetSubstructMatch(pose_mol)
+            # print('Seed', seed_match)
+            # print('Pose', pose_mol.GetSubstructMatch(seed_copy))
+            if len(seed_match) != mcs.numAtoms:
+                import pdb;pdb.set_trace()
+            
+            seed_conf = seed_copy.GetConformer()
+            pose_coords = pose_mol.GetConformer().GetPositions()
+            for pose_i, seed_i  in enumerate(seed_match):
+                coord = pose_coords[pose_i]
+                seed_symbol = seed_copy.GetAtomWithIdx(seed_i).GetSymbol()
+                pose_symbol = pose_mol.GetAtomWithIdx(pose_i).GetSymbol()
+                if seed_symbol != pose_symbol :
                     import pdb;pdb.set_trace()
+                point = Point3D(*coord)
+                seed_conf.SetAtomPosition(seed_i, point)
+                
+            ligand = mols[i]
+            ligand_centroid = ligand.GetConformer().GetPositions().mean(0)
+            pose_centroid = seed_conf.GetPositions().mean(0)
+            centroid_distance = euclidean(ligand_centroid, pose_centroid)
+            if centroid_distance > 5:
+                import pdb;pdb.set_trace()
+                
+            try:
+                env.set_seed_coordinates(seed_copy)
+            except Exception as e:
+                print(type(e), str(e))
+                import pdb;pdb.set_trace()
+                
+            terminated = self.terminateds[env_i]
+            if terminated:
+                env.seed.protect()
+            else:
+                env.seed_to_frame()
             
-                # valid_idx = [d[i.item()] for i in frag_actions]
-                # scores = [self.absolute_scores[i] for i in valid_idx]
-        
-        relative_scores = [new_score - previous_score 
-                        for new_score, previous_score in zip(scores, self.current_scores)]
         batch_rewards = [-score for score in relative_scores]
-        
-        self.current_scores = scores
-        
-        # print(batch_rewards)
-        # print(time.time() - st)
-        # import pdb;pdb.set_trace()
-        
         
         for i, (reward, truncated) in enumerate(zip(batch_rewards, batch_truncated)):
             if truncated:
-                batch_rewards[i] = -1.0
+                batch_rewards[i] = -10.0
         
         # this will cause truncation to extend to termination
         for env_i, reward in zip(self.ongoing_env_idxs, batch_rewards):

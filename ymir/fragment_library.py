@@ -150,11 +150,12 @@ class FragmentLibrary():
                 
 
     def get_restricted_fragments(self,
-                                 z_list: list[int]):
+                                 z_list: list[int],
+                                 max_attach: int = 10):
         protected_fragments = select_mol_with_symbols(self.protected_fragments,
                                               z_list)
 
-        # Select only fragments with 1 attach point
+        # Select only fragments with at most max_attach point
         n_attaches = []
         for fragment in protected_fragments:
             frag_copy = Fragment(mol=fragment,
@@ -166,7 +167,7 @@ class FragmentLibrary():
 
         protected_fragments = [fragment 
                             for fragment, n in zip(protected_fragments, n_attaches)
-                            if n == 1]
+                            if n <= max_attach]
                 
         unique_fragments = []
         unique_smiles = []

@@ -1,4 +1,5 @@
 import os
+import glob
 import subprocess
 import logging
 
@@ -21,8 +22,9 @@ def run_vina(vina_cmd: list[str]):
         completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
         stdout = completed_process.stdout.decode('utf-8')
         stderr = completed_process.stderr.decode('utf-8')
-        # logging.info(stdout)
-        logging.debug(stderr)
+        logging.info(stdout)
+        if len(stderr) > 2:
+            logging.info(stderr)
         
         for line in stdout.split('\n'):
             if line.startswith('Estimated Free Energy of Binding   :'):
@@ -45,7 +47,7 @@ class VinaCLI():
                  seed: int = VINA_SEED,
                  config_path: str = VINA_CONFIG_PATH,
                  vina_path: str = VINA_PATH,
-                 verbosity: int = 0) -> None:
+                 verbosity: int = 2) -> None:
         self.score_only = score_only
         self.ligands_directory = ligands_directory
         self.output_directory = output_directory
@@ -69,6 +71,14 @@ class VinaCLI():
         
         if add_hydrogens:
             ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
+            
+        old_ligand_files = glob.glob(os.path.join(self.ligands_directory, '*'))
+        for f in old_ligand_files:
+            os.remove(f)
+            
+        old_poses_files = glob.glob(os.path.join(self.output_directory, '*'))
+        for f in old_poses_files:
+            os.remove(f)
             
         ligand_paths = self.write_ligands(ligands)
         base_vina_cmd = self.get_base_vina_cmd()
@@ -114,16 +124,24 @@ class VinaCLI():
         ligand_pathes = []
         for i, ligand in enumerate(ligands) :
             ligand_name = f'Ligand_{i}'
-            preparator = MoleculePreparation()
+            preparator = MoleculePreparation(merge_these_atom_types=(),
+                                             rigid_macrocycles=True)
             mol_setups = preparator.prepare(ligand)
             mol_setup = mol_setups[0]
             pdbqt_string, is_ok, error_msg = PDBQTWriterLegacy.write_string(setup=mol_setup, 
+                                                                            add_index_map=True,
+                                                                            remove_smiles=True,
                                                                             bad_charge_ok=True)
+            if 'G' in pdbqt_string:
+                import pdb;pdb.set_trace()
+                
             if is_ok:
                 ligand_path = os.path.join(self.ligands_directory, f'{ligand_name}.pdbqt')
                 ligand_pathes.append(ligand_path)
                 with open(ligand_path, 'w') as f:
                     f.write(pdbqt_string)
+            else:
+                import pdb;pdb.set_trace()
         
         return ligand_pathes
     

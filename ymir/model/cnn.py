@@ -187,8 +187,7 @@ class CNN(torch.nn.Module):
         #                  dim=0,
         #                  reduce='mean')
         
-        is_attach = batch.x == 0
-        output = x[is_attach]
+        output = x[batch.is_focal]
         # assert output.shape[0] == batch.batch.max() + 1
         
         # rot = o3.rand_matrix().to(pos)

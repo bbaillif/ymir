@@ -21,10 +21,12 @@ class Featurizer():
                         center_pos: tuple[float, float, float] = None,
                         embed_hydrogens: bool = False,
                         max_radius: float = POCKET_RADIUS,
+                        focal_id: int = None
                         ) -> tuple[list[int], list[float]]:
         mol_positions = mol.GetConformer().GetPositions()
         x = []
         pos = []
+        is_focal = []
         center_pos = np.array(center_pos)
         for atom_i, atom in enumerate(mol.GetAtoms()):
             atomic_num = atom.GetAtomicNum()
@@ -42,8 +44,9 @@ class Featurizer():
                     # one_hot[idx] = 1.0
                     # x.append(one_hot)
                     pos.append(atom_pos.tolist())
+                    is_focal.append(atom_i == focal_id)
         
-        return x, pos
+        return x, pos, is_focal
 
     def get_fragment_features(self,
                               fragment: Fragment,
@@ -51,12 +54,18 @@ class Featurizer():
                             embed_hydrogens: bool = False,
                             max_radius: float = POCKET_RADIUS,):
         
+        aps = fragment.get_attach_points()
+        assert len(aps) == 1
+        focal_id = list(aps.keys())[0]
+    
         frag_copy = Fragment(fragment,
                             protections=fragment.protections)
         frag_copy.unprotect()
-        x, pos = self.get_mol_features(mol=frag_copy, 
+        x, pos, is_focal = self.get_mol_features(mol=frag_copy, 
                                         center_pos=center_pos,
                                         embed_hydrogens=embed_hydrogens,
-                                        max_radius=max_radius)
-        return x, pos
+                                        max_radius=max_radius,
+                                        focal_id=focal_id)
+        
+        return x, pos, is_focal
     
