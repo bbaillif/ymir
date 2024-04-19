@@ -142,6 +142,9 @@ if not os.path.exists(VINA_LIGANDS_DIRECTORY):
 VINA_OUTPUT_DIRECTORY = '/home/bb596/ymir/vina/poses/'
 if not os.path.exists(VINA_OUTPUT_DIRECTORY):
     os.mkdir(VINA_OUTPUT_DIRECTORY)
+VINA_MAPS_DIRECTORY = '/home/bb596/ymir/vina/maps/'
+if not os.path.exists(VINA_MAPS_DIRECTORY):
+    os.mkdir(VINA_MAPS_DIRECTORY)
 VINA_CPUS = 12
 VINA_SEED = SEED
 VINA_CONFIG_PATH = '/home/bb596/ymir/vina/config.txt'

@@ -182,7 +182,7 @@ final_fragments = protected_fragments
 
 from rdkit.Chem.rdMolDescriptors import CalcNumRotatableBonds
 n_torsions = [CalcNumRotatableBonds(frag) for frag in final_fragments]
-import pdb;pdb.set_trace()
+final_fragments = [frag for frag, n_torsion in zip(final_fragments, n_torsions) if n_torsion == 0]
 
 valid_action_masks = get_masks(final_fragments)
 
@@ -229,121 +229,174 @@ logging.info(f'Training on {n_complexes} complexes')
 def episode(seed_idxs, 
             batch_env: BatchEnv,
             train: bool = True):
-    current_seeds = [seeds[seed_i] for seed_i in seed_idxs]
-    current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
-    current_initial_scores = [initial_scores[seed_i] for seed_i in seed_idxs]
     
-    next_info = batch_env.reset(current_complexes,
-                                current_seeds,
-                                current_initial_scores)
-    next_terminated = [False] * n_envs
+    try:
     
-    step_i = 0
-    ep_logprobs = []
-    ep_rewards = []
-    ep_entropies = []
-    ep_terminateds: list[list[bool]] = [] # (n_steps, n_envs)
-    while step_i < n_steps and not all(next_terminated):
+        current_seeds = [seeds[seed_i] for seed_i in seed_idxs]
+        current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
+        current_initial_scores = [initial_scores[seed_i] for seed_i in seed_idxs]
         
-        current_terminated = next_terminated
-        current_obs = batch_env.get_obs()
+        next_info = batch_env.reset(current_complexes,
+                                    current_seeds,
+                                    current_initial_scores)
+        next_terminated = [False] * n_envs
         
-        current_masks = batch_env.get_valid_action_mask()
-        
-        batch = Batch.from_data_list(current_obs).to(device)
-        features = agent.extract_features(batch)
-        
-        if current_masks.size()[0] != features.size()[0] :
-            import pdb;pdb.set_trace()
-        
-        current_masks = current_masks.to(device)
-        current_action: Action = agent.get_action(features,
-                                                    masks=current_masks)
-        current_frag_actions = current_action.frag_i.cpu()
-        current_frag_logprobs = current_action.frag_logprob.cpu()
-        
-        t = batch_env.step(frag_actions=current_frag_actions)
-        
-        logging.info(current_frag_actions)
-        logging.info(current_frag_logprobs.exp())
-        
-        step_rewards, next_terminated, next_truncated, next_info = t
-        
-        ep_logprobs.append(current_action.frag_logprob)
-        ep_rewards.append(step_rewards)
-        ep_entropies.append(current_action.frag_entropy)
-        ep_terminateds.append(current_terminated)
-        
-        step_i += 1
-        
-    reversed_rewards = reversed(ep_rewards)
-    reversed_terminateds = reversed(ep_terminateds)
-    reversed_returns = [] # (n_non_term_envs, 1)
-    z = zip(reversed_terminateds, reversed_rewards)
-    for step_terminated, step_rewards in z:
-        step_non_terminated = [not terminated for terminated in step_terminated]
-        non_terminated_idxs = np.where(step_non_terminated)[0]
-        
-        try:
-            assert len(non_terminated_idxs) == step_rewards.shape[0]
-        except:
-            import pdb;pdb.set_trace()
-        
-        current_return = []
-        last_returns = {env_i: 0 for env_i in range(n_envs)}
-        z = zip(non_terminated_idxs, step_rewards)
-        for env_i, step_reward in z:
-            last_return = last_returns[env_i]
-            retrn = step_reward + last_return * gamma
-            current_return.append(retrn)
-            last_return[env_i] = retrn
+        step_i = 0
+        ep_logprobs = []
+        ep_rewards = []
+        ep_entropies = []
+        ep_terminateds: list[list[bool]] = [] # (n_steps, n_envs)
+        while step_i < n_steps and not all(next_terminated):
+            
+            current_terminated = next_terminated
+            current_obs = batch_env.get_obs()
+            
+            current_masks = batch_env.get_valid_action_mask()
+            
+            batch = Batch.from_data_list(current_obs).to(device)
+            features = agent.extract_features(batch)
+            
+            if current_masks.size()[0] != features.size()[0] :
+                import pdb;pdb.set_trace()
+            
+            current_masks = current_masks.to(device)
+            current_action: Action = agent.get_action(features,
+                                                        masks=current_masks)
+            current_frag_actions = current_action.frag_i.cpu()
+            current_frag_logprobs = current_action.frag_logprob.cpu()
+            
+            t = batch_env.step(frag_actions=current_frag_actions)
+            
+            logging.info(current_frag_actions)
+            logging.info(current_frag_logprobs.exp())
+            
+            step_rewards, next_terminated, next_truncated, next_info = t
+            
+            ep_logprobs.append(current_action.frag_logprob)
+            ep_rewards.append(step_rewards)
+            ep_entropies.append(current_action.frag_entropy)
+            ep_terminateds.append(current_terminated)
+            
+            step_i += 1
+            
+        batch_env.save_state()
+            
+        reversed_rewards = reversed(ep_rewards)
+        reversed_terminateds = reversed(ep_terminateds)
+        reversed_returns = [] # (n_non_term_envs, 1)
+        z = zip(reversed_terminateds, reversed_rewards)
+        for step_terminated, step_rewards in z:
+            step_non_terminated = [not terminated for terminated in step_terminated]
+            non_terminated_idxs = np.where(step_non_terminated)[0]
+            
+            try:
+                assert len(non_terminated_idxs) == len(step_rewards)
+            except:
+                import pdb;pdb.set_trace()
+            
+            current_return = []
+            last_returns = {env_i: 0 for env_i in range(n_envs)}
+            z = zip(non_terminated_idxs, step_rewards)
+            for env_i, step_reward in z:
+                last_return = last_returns[env_i]
+                retrn = step_reward + last_return * gamma
+                current_return.append(retrn)
+                last_returns[env_i] = retrn
 
-        current_return = torch.tensor(current_return, device=device)
-        reversed_returns.append(current_return)
+            current_return = torch.tensor(current_return, device=device)
+            reversed_returns.append(current_return)
+            
+        returns = list(reversed(reversed_returns))
         
-    returns = list(reversed(reversed_returns))
-    
-    # losses = []
-    policy_losses = []
-    if use_entropy_loss:
-        entropy_losses = []
-    for logprob, retrn in zip(ep_logprobs, returns):
-        policy_loss = -logprob * retrn
-        policy_losses.append(policy_loss)
-        # loss = policy_loss
+        all_returns = torch.cat(returns)
+        all_logprobs = torch.cat(ep_logprobs)
+        all_entropies = torch.cat(ep_entropies)
+        
+        all_returns = (all_returns - all_returns.mean()) / (all_returns.std() + 1e-5)
+        
+        policy_loss = -all_logprobs * all_returns
         if use_entropy_loss:
-            entropy = current_action.frag_entropy
-            entropy_loss = - entropy * ent_coef # we want to keep entropy high = minimize negative entropy
-            entropy_losses.append(entropy_loss)
-            # loss = loss + entropy_loss
-        # losses.append(loss)
+            entropy_loss = - all_entropies * ent_coef
+            loss = policy_loss + entropy_loss
+        else:
+            loss = policy_loss
+            
+        loss = loss.mean()
         
-    loss = torch.cat(policy_losses).sum()
-    if use_entropy_loss:
-        loss = loss + torch.cat(entropy_losses).sum() * ent_coef
+        # n_obs = all_returns.size()[0]
+        # inds = np.arange(n_obs)
+        # np.random.shuffle(inds)
+        # all_losses = []
+        # for start in range(0, n_obs, batch_size):
+        #     end = start + batch_size
+        #     minibatch_inds = inds[start:end]
+            
+        #     n_sample = len(minibatch_inds)
+        #     if n_sample > 2: # we only want to update if we have more than 1 sample in the batch
         
-    import pdb;pdb.set_trace()
+        #         mb_logprobs = all_logprobs[minibatch_inds]
+        #         mb_returns = all_returns[minibatch_inds]
+        #         mb_entropies = all_entropies[minibatch_inds]
         
-    # # logging.info(np.around(reward, 2))  
-    # R = 0
-    # returns = deque()
-    # for r in ep_rewards[::-1]:
-    #     R = r + gamma * R
-    #     returns.appendleft(R)
-    # returns = torch.tensor(returns, device=device, dtype=torch.float)
-    # # reward = torch.tensor(reward, device=device, dtype=torch.float)
+        #         policy_loss = -mb_logprobs * mb_returns
+        #         if use_entropy_loss:
+        #             entropy_loss = - mb_entropies * ent_coef
+        #             loss = policy_loss + entropy_loss
+        #         else:
+        #             loss = policy_loss
+                
+        #         loss = loss.mean()
+        
+                # # losses = []
+                # policy_losses = []
+                # if use_entropy_loss:
+                #     entropy_losses = []
+                # for logprob, retrn, entropy in zip(all_logprobs, all_returns, all_entropies):
+                #     policy_loss = -logprob * retrn
+                #     policy_losses.append(policy_loss)
+                #     # loss = policy_loss
+                #     if use_entropy_loss:
+                #         entropy_loss = - entropy * ent_coef # we want to keep entropy high = minimize negative entropy
+                #         entropy_losses.append(entropy_loss)
+                #         # loss = loss + entropy_loss
+                #     # losses.append(loss)
+                    
+                # loss = torch.cat(policy_losses).sum()
+                # if use_entropy_loss:
+                #     loss = loss + torch.cat(entropy_losses).sum() * ent_coef
+            
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+        # # logging.info(np.around(reward, 2))  
+        # R = 0
+        # returns = deque()
+        # for r in ep_rewards[::-1]:
+        #     R = r + gamma * R
+        #     returns.appendleft(R)
+        # returns = torch.tensor(returns, device=device, dtype=torch.float)
+        # # reward = torch.tensor(reward, device=device, dtype=torch.float)
 
-    if train:
-        subset = 'train'
-    else:
-        subset = 'val'
-    writer.add_scalar(f"{subset}/policy_loss", policy_loss.mean().item(), episode_i)
-    writer.add_scalar(f"{subset}/fragment_entropy", entropy.mean().item(), episode_i)
-    writer.add_scalar(f"{subset}/entropy_loss", entropy_loss.mean().item(), episode_i)
-    writer.add_scalar(f"{subset}/loss", loss.item(), episode_i)
-    writer.add_scalar(f"{subset}/mean_reward", returns[0].mean().item(), episode_i)
+        if train:
+            subset = 'train'
+        else:
+            subset = 'val'
+            
+        writer.add_scalar(f"{subset}/policy_loss", policy_loss.mean().item(), episode_i)
+        writer.add_scalar(f"{subset}/entropy_loss", entropy_loss.mean().item(), episode_i)
+        writer.add_scalar(f"{subset}/loss", loss.item(), episode_i)
+        writer.add_scalar(f"{subset}/fragment_entropy", all_entropies.mean().item(), episode_i)
+        writer.add_scalar(f"{subset}/mean_reward", returns[0].mean().item(), episode_i)
 
-    return loss
+        # return all_losses
+        
+    except Exception as e:
+        print(type(e))
+        print(e)
+        import pdb;pdb.set_trace()
+        
 
 # try:
 
@@ -366,10 +419,10 @@ for episode_i in tqdm(range(n_episodes)):
         train_i.append(current_i)
         current_i = (current_i + 1) % n_complexes
         
-    loss = episode(train_i, batch_env)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    episode(train_i, batch_env)
+    # optimizer.zero_grad()
+    # loss.backward()
+    # optimizer.step()
     
     # with torch.no_grad():
     #     episode(val_seed_idxs, val_batch_env, train=False)

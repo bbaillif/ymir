@@ -70,6 +70,59 @@ class FragmentBuilderEnv():
         return self._action_dim
         
         
+    def reset(self, 
+              complx: Complex,
+              seed: Fragment,
+              initial_score: float,
+            #   memory: dict
+              ) -> tuple[Data, dict[str, Any]]:
+        
+        self.complex = complx
+        self.seed = Fragment(seed,
+                             protections=seed.protections)
+        # self.memory = memory
+        self.initial_score = initial_score
+        self.current_score = initial_score
+        
+        self.pocket_mol = Mol(self.complex.pocket.mol)
+        
+        self.transformations = []
+        
+        random_rotation = Rotation.random()
+        rotate_conformer(self.pocket_mol.GetConformer(), rotation=random_rotation)
+        rotate_conformer(self.seed.GetConformer(), rotation=random_rotation)
+        self.transformations.append(random_rotation)
+        
+        # self.original_seed = Chem.Mol(self.seed)
+        
+        self.terminated = self.set_focal_atom_id() # seed is protected
+        assert self.terminated is False, 'No attachement point in the seed'
+        self.truncated = False
+        
+        assert not self.terminated
+        
+        self.seed_to_frame()
+        
+        # observation = self._get_obs()
+        info = self._get_info()
+        
+        self.actions = []
+        
+        self.valid_action_mask = self.get_valid_action_mask()
+        has_valid_action = torch.any(self.valid_action_mask)
+        self.terminated = not has_valid_action
+        
+        # this should not happen, unless the set of fragments is 
+        # not suitable for the given starting situation
+        if self.terminated: 
+            import pdb;pdb.set_trace()
+        
+        self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
+        
+        # return observation, info
+        return info
+        
+        
     def seed_to_frame(self):
 
         # Chem.MolToMolFile(self.seed, 'seed_before.mol')
@@ -111,16 +164,23 @@ class FragmentBuilderEnv():
         fragment_i = frag_action
         protected_fragment = self.protected_fragments[fragment_i]
         
-        new_fragments = [protected_fragment]
+        rotations = []
+        for angle in range(-180, 180, 10):
+            rotation = Rotation.from_euler('x', angle, degrees=True)
+            rotations.append(rotation)
         
+        new_fragments = [Fragment(protected_fragment, protected_fragment.protections) for _ in rotations]
+        for frag, rotation in zip(new_fragments, rotations):
+            rotate_conformer(frag.GetConformer(), rotation=rotation)
+
         return new_fragments
         
         
     def translate_seed(self,
-                       fragment: Fragment):
+                       added_fragment: Fragment):
         # translate the seed that had the neighbor at 0 to the neighbor at -interatomic_distance
         # Such that the fragment neighbor that is also the seed attach point is (0,0,0)
-        distance = self.get_seed_fragment_distance(fragment) # hard coded but should be modified
+        distance = self.get_seed_fragment_distance(added_fragment) # hard coded but should be modified
         
         translation = np.array([-distance, 0, 0])
         translate_conformer(self.seed.GetConformer(), translation=translation)
@@ -136,14 +196,52 @@ class FragmentBuilderEnv():
                                  frag_action: int) -> None:
         
         new_fragments = self.get_new_fragments(frag_action)
-        self.translate_seed(fragment=new_fragments[0])
-        
         new_fragment = new_fragments[0]
-        product = add_fragment_to_seed(seed=self.seed,
+        self.translate_seed(added_fragment=new_fragment)
+        
+        products = [add_fragment_to_seed(seed=self.seed,
                                         fragment=new_fragment)
+                    for new_fragment in new_fragments]
+        product_clash = [self.get_pocket_ligand_clash(product) for product in products]
+        
+        default_product = products[0]
+        products = [product for product, clash in zip(products, product_clash) if not clash]
+        
+        if len(products) > 0:
+        
+            vina_cli = VinaCLI()
+            receptor_paths = [self.complex.vina_protein.pdbqt_filepath
+                            for _ in products]
+            native_ligands = [self.complex.ligand for _ in products]
+            frags = [Fragment(product, product.protections) for product in products]
+            mols = [self.get_clean_mol(frag) for frag in frags]
+            scores = vina_cli.get(receptor_paths=receptor_paths,
+                                native_ligands=native_ligands,
+                                ligands=mols)
+            relative_scores = [score - self.current_score for score in scores]
+            rewards = [-score for score in relative_scores]
+        
+            # product_clash = [self.get_pocket_ligand_clash(product) for product in products]
+            # clash_penalty = [0 if not clash else -10 for clash in product_clash]
+                
+            # penalized_rewards = [reward + penalty for reward, penalty in zip(rewards, clash_penalty)]
+        
+            # TODO: Add variability : not follow a greedy policy
+            # best_reward_i = np.argmax(penalized_rewards)
+            best_reward_i = np.argmax(rewards)
             
-        # TODO: put the optimized pose
-        self.seed = product
+            product = products[best_reward_i]
+            self.current_score = scores[best_reward_i]
+            self.seed = product
+            
+            # reward = penalized_rewards[best_reward_i]
+            reward = rewards[best_reward_i]
+            
+        else:
+            self.seed = default_product
+            reward = -10
+            
+        return reward
         
     
     def _get_obs(self):
@@ -209,60 +307,6 @@ class FragmentBuilderEnv():
         return data
     
     
-    def reset(self, 
-              complx: Complex,
-              seed: Fragment,
-              scorer: VinaScore,
-              seed_i: int,
-            #   memory: dict
-              ) -> tuple[Data, dict[str, Any]]:
-        
-        self.complex = complx
-        self.seed = Fragment(seed,
-                             protections=seed.protections)
-        self.scorer = scorer
-        self.seed_i = seed_i
-        # self.memory = memory
-        
-        self.pocket_mol = Mol(self.complex.pocket.mol)
-        
-        self.transformations = []
-        
-        random_rotation = Rotation.random()
-        rotate_conformer(self.pocket_mol.GetConformer(), rotation=random_rotation)
-        rotate_conformer(self.seed.GetConformer(), rotation=random_rotation)
-        self.transformations.append(random_rotation)
-        
-        # self.original_seed = Chem.Mol(self.seed)
-        
-        self.terminated = self.set_focal_atom_id() # seed is protected
-        assert self.terminated is False, 'No attachement point in the seed'
-        self.truncated = False
-        
-        assert not self.terminated
-        
-        self.seed_to_frame()
-        
-        # observation = self._get_obs()
-        info = self._get_info()
-        
-        self.actions = []
-        
-        self.valid_action_mask = self.get_valid_action_mask()
-        has_valid_action = torch.any(self.valid_action_mask)
-        self.terminated = not has_valid_action
-        
-        # this should not happen, unless the set of fragments is 
-        # not suitable for the given starting situation
-        if self.terminated: 
-            import pdb;pdb.set_trace()
-        
-        self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
-        
-        # return observation, info
-        return info
-    
-    
     def set_focal_atom_id(self) -> bool:
         
         terminated = False
@@ -282,11 +326,7 @@ class FragmentBuilderEnv():
         self.actions.append(frag_action)
         n_actions = len(self.actions)
         
-        self.action_to_fragment_build(frag_action) # seed is deprotected
-        
-        self.terminated = self.set_focal_atom_id() # seed is protected
-        
-        reward = 0
+        reward = self.action_to_fragment_build(frag_action) # seed is deprotected
         
         if n_actions == self.max_episode_steps: # not terminated but reaching max step size
             self.truncated = True
@@ -309,6 +349,8 @@ class FragmentBuilderEnv():
         
         # observation = self._get_obs()
         info = self._get_info()
+        
+        self.terminated = self.set_focal_atom_id() # seed is protected
         
         # return observation, reward, self.terminated, self.truncated, info
         return reward, self.terminated, self.truncated, info
@@ -342,212 +384,6 @@ class FragmentBuilderEnv():
         # valid_action_mask = torch.logical_and(valid_action_mask, valid_positions)
         
         return valid_action_mask
-    
-    
-    def get_clashes(self) -> list[bool]:
-        
-        master_mol = Chem.CombineMols(self.seed, self.pocket_mol)
-        for fragment in self.protected_fragments:
-            master_mol = Chem.CombineMols(master_mol, fragment)
-            
-        from timeit import default_timer as timer
-        start = timer()
-        distance_matrix = Chem.Get3DDistanceMatrix(mol=master_mol)
-        print(timer() - start)
-        
-        import pdb;pdb.set_trace()
-        
-        return [False] * self.n_fragments
-    
-    
-    def get_clashes2(self) -> list[bool]:
-        
-        for atom in self.seed.GetAtoms():
-            if atom.GetAtomicNum() == 0:
-                seed_attach_atom = atom
-                break
-        n_seed_atoms = self.seed.GetNumAtoms()
-        
-        vdw_distances = defaultdict(dict)
-        def get_vdw_min_distance(symbol1, symbol2):
-            vdw1 = self.geometry_extractor.get_vdw_radius(symbol1)
-            vdw2 = self.geometry_extractor.get_vdw_radius(symbol2)
-            
-            if symbol1 == 'H':
-                min_distance = vdw2
-            elif symbol2 == 'H':
-                min_distance = vdw1
-            else:
-                # min_distance = vdw1 + vdw2 - self.clash_tolerance
-                min_distance = vdw1 + vdw2
-                
-            min_distance = min_distance * 0.75
-            
-            return min_distance
-        
-        all_has_clashes = []
-        for fragment in tqdm(self.protected_fragments):
-            
-            assert fragment.GetNumConformers() == 1
-            
-            #### Pocket - ligand clashes
-            
-            # pf = Chem.CombineMols(self.pocket_mol, fragment)
-            # pfs = Chem.CombineMols(pf, self.seed)
-            # atoms = [atom for atom in pfs.GetAtoms()]
-            # n_pocket_atoms = self.pocket_mol.GetNumAtoms()
-            # n_fragment_atoms = fragment.GetNumAtoms()
-            # pocket_atoms = atoms[:n_pocket_atoms]
-            # fragment_atoms = atoms[n_pocket_atoms:n_pocket_atoms+n_fragment_atoms]
-            # seed_atoms = atoms[n_pocket_atoms+n_fragment_atoms:]
-            # distance_matrix = Chem.Get3DDistanceMatrix(mol=pfs)
-            # pf_distance_matrix = distance_matrix[:n_pocket_atoms, n_pocket_atoms:n_pocket_atoms+n_fragment_atoms]
-            
-            # TOO SLOW
-            pocket_pos = self.pocket_mol.GetConformer().GetPositions()
-            pocket_atoms = self.pocket_mol.GetAtoms()
-            # n_pocket_atoms = len(pocket_atoms)
-            fragment_pos = fragment.GetConformer().GetPositions()
-            fragment_atoms = fragment.GetAtoms()
-            # n_fragment_atoms = len(fragment_atoms)
-            # distance_matrix = cdist(pocket_pos, fragment_pos)
-            
-            margin = 2.7
-            min_fragment_pos = fragment_pos.min(axis=0)
-            max_fragment_pos = fragment_pos.max(axis=0)
-            min_fragment_pos = min_fragment_pos - margin
-            max_fragment_pos = max_fragment_pos + margin
-            beyond_fragment_min = (pocket_pos < min_fragment_pos).any(axis=1)
-            beyond_fragment_max = (pocket_pos > max_fragment_pos).any(axis=1)
-            beyond_fragment = np.logical_or(beyond_fragment_min, beyond_fragment_max)
-            close_to_fragment = np.logical_not(beyond_fragment)
-            indices_close = np.nonzero(close_to_fragment)[0]
-            
-            if len(indices_close) > 0:
-                pocket_pos = pocket_pos[indices_close]
-                pocket_atoms = [atom 
-                                for i, atom in enumerate(pocket_atoms) 
-                                if i in indices_close]
-                # pf_distance_matrix = metrics.pairwise_distances(pocket_pos, fragment_pos)
-                pf_distance_matrix = cdist(pocket_pos, fragment_pos)
-            else:
-                pocket_atoms = []
-                pf_distance_matrix = []
-                
-            # import pdb;pdb.set_trace()
-            
-            has_clash = False
-        
-            for idx1, atom1 in enumerate(pocket_atoms):
-                for idx2, atom2 in enumerate(fragment_atoms):
-                    
-                    symbol1 = atom1.GetSymbol()
-                    symbol2 = atom2.GetSymbol()
-                    if symbol2 == 'R':
-                        symbol2 = 'C' # we mimic that the fragment will bind to a Carbon
-                        
-                    if symbol1 > symbol2: # sort symbols
-                        symbol1, symbol2 = symbol2, symbol1
-                    
-                    if symbol1 in vdw_distances:
-                        if symbol2 in vdw_distances[symbol1]:
-                            min_distance = vdw_distances[symbol1][symbol2]
-                        else:
-                            min_distance = get_vdw_min_distance(symbol1, symbol2)
-                            vdw_distances[symbol1][symbol2] = min_distance
-                    else:
-                        min_distance = get_vdw_min_distance(symbol1, symbol2)
-                        vdw_distances[symbol1][symbol2] = min_distance
-                        
-                    distance = pf_distance_matrix[idx1, idx2]
-                    if distance < min_distance:
-                        has_clash = True
-                        break
-                    
-                if has_clash:
-                    break
-                        
-            # Seed - Fragment clashes
-                      
-            if not has_clash:
-                      
-                seed_attach_atom_id = seed_attach_atom.GetIdx()
-                seed_neighbor_atom_id = seed_attach_atom.GetNeighbors()[0].GetIdx()
-                      
-                for atom in fragment.GetAtoms():
-                    if atom.GetAtomicNum() == 0:
-                        fragment_attach_atom = atom
-                        break
-                      
-                fragment_attach_atom_id = fragment_attach_atom.GetIdx()
-                fragment_neighbor_atom_id = fragment_attach_atom.GetNeighbors()[0].GetIdx()
-                
-                # fragment_attach_atom_id = fragment_attach_atom_id + n_seed_atoms
-                # fragment_neighbor_atom_id = fragment_neighbor_atom_id + n_seed_atoms
-                
-                # fs_distance_matrix = distance_matrix[n_pocket_atoms:n_pocket_atoms+n_fragment_atoms, n_pocket_atoms+n_fragment_atoms:]
-                
-                seed_pos = self.seed.GetConformer().GetPositions()
-                seed_atoms = self.pocket_mol.GetAtoms()
-                
-                min_fragment_pos = fragment_pos.min(axis=0)
-                max_fragment_pos = fragment_pos.max(axis=0)
-                beyond_fragment_min = (seed_pos < min_fragment_pos).any(axis=1)
-                beyond_fragment_max = (seed_pos > max_fragment_pos).any(axis=1)
-                beyond_fragment = np.logical_or(beyond_fragment_min, beyond_fragment_max)
-                close_to_fragment = np.logical_not(beyond_fragment)
-                indices_close = np.nonzero(close_to_fragment)[0]
-                
-                if len(indices_close) > 0:
-                
-                    seed_pos = seed_pos[indices_close]
-                    seed_atoms = [atom 
-                                    for i, atom in enumerate(seed_atoms) 
-                                    if i in indices_close]
-                    
-                    # fs_distance_matrix = metrics.pairwise_distances(fragment_pos, seed_pos)
-                    fs_distance_matrix = cdist(fragment_pos, seed_pos)
-                    
-                else:
-                    seed_atoms = []
-                    fs_distance_matrix = []
-                
-                # import pdb;pdb.set_trace()
-
-                for idx1, atom1 in enumerate(fragment_atoms):
-                    if idx1 not in [fragment_neighbor_atom_id, fragment_attach_atom_id]:
-                        for idx2, atom2 in enumerate(seed_atoms):
-                            if idx2 not in [seed_neighbor_atom_id, seed_attach_atom_id]:
-                            
-                                symbol1 = atom1.GetSymbol()
-                                symbol2 = atom2.GetSymbol()
-                                if symbol2 == 'R':
-                                    symbol2 = 'C' # we mimic that the fragment will bind to a Carbon
-                                    
-                                if symbol1 > symbol2:
-                                    symbol1, symbol2 = symbol2, symbol1
-                                
-                                if symbol1 in vdw_distances:
-                                    if symbol2 in vdw_distances[symbol1]:
-                                        min_distance = vdw_distances[symbol1][symbol2]
-                                    else:
-                                        min_distance = get_vdw_min_distance(symbol1, symbol2)
-                                        vdw_distances[symbol1][symbol2] = min_distance
-                                else:
-                                    min_distance = get_vdw_min_distance(symbol1, symbol2)
-                                    vdw_distances[symbol1][symbol2] = min_distance
-                                    
-                                distance = fs_distance_matrix[idx1, idx2]
-                                if distance < min_distance:
-                                    has_clash = True
-                                    break
-                        
-                    if has_clash:
-                        break
-                        
-            all_has_clashes.append(has_clash)
-                    
-        return all_has_clashes
     
     
     def get_pocket_ligand_clash(self,
@@ -749,17 +585,14 @@ class BatchEnv():
               complexes: list[Complex],
               seeds: list[Fragment],
               initial_scores: list[float],
-              absolute_scores: list[float] = None,
-              scorer: VinaScore = None,
-              seed_i: int = None) -> tuple[list[Data], list[dict[str, Any]]]:
+              absolute_scores: list[float] = None) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
         batch_info: list[dict[str, Any]] = []
-        for env, seed, complx in zip(self.envs, seeds, complexes):
-            info = env.reset(complx,
-                             seed,
-                             scorer,
-                             seed_i,
+        for i, env in enumerate(self.envs):
+            info = env.reset(complexes[i],
+                             seeds[i],
+                             initial_score=initial_scores[i],
                             #  self.memory
                              )
             batch_info.append(info)
@@ -787,7 +620,7 @@ class BatchEnv():
         masks = []
         for env_i in self.ongoing_env_idxs:
             env = self.envs[env_i]
-            valid_action_mask = env.valid_action_mask # the get_valid_action_mask() is called earlier
+            valid_action_mask = env.get_valid_action_mask()
             masks.append(valid_action_mask)
         masks = torch.stack(masks)
         non_terminated = [not terminated for terminated in self.terminateds]
@@ -813,105 +646,21 @@ class BatchEnv():
 
         batch_truncated = []
         batch_info = []
-        mols = []
-        receptor_paths = []
-        native_ligands = []
+        batch_rewards = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             frag_action = int(frag_action)
-            _, terminated, truncated, info = env.step(frag_action)
+            reward, terminated, truncated, info = env.step(frag_action)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
             
             batch_truncated.append(truncated)
             batch_info.append(info)
-            
-            receptor_paths.append(env.complex.vina_protein.pdbqt_filepath)
-            native_ligands.append(env.complex.ligand)
-            mol = env.get_clean_mol(env.seed)
-            mols.append(mol)
-            # mini_mol = env.get_minimized_mol()
-            # import pdb;pdb.set_trace()
+            batch_rewards.append(reward)
         
-        scores = self.vina_cli.get(receptor_paths=receptor_paths,
-                                    native_ligands=native_ligands,
-                                    ligands=mols)
-            
-        relative_scores = []
-        for env_i, new_score in zip(self.ongoing_env_idxs, scores):
-            previous_score = self.current_scores[env_i]
-            relative_score = new_score - previous_score
-            relative_scores.append(relative_score)
-            self.current_scores[env_i] = new_score
-            
-        for i, env_i in enumerate(self.ongoing_env_idxs):
-            env = self.envs[env_i]
-            pose_path = os.path.join(self.vina_cli.output_directory, f'Ligand_{i}_out.pdbqt')
-            # pdbqt_mol = PDBQTMolecule.from_file(pose_path, skip_typing=True)
-            
-            # try:
-            #     rdkitmol_list = RDKitMolCreate.from_pdbqt_mol(pdbqt_mol)
-            # except Exception as e:
-            #     print(e)
-            #     print(type(e))
-            #     import pdb;pdb.set_trace()
-            # pose_mol = rdkitmol_list[0]
-            # pose_mol = Chem.MolFromPDBFile(pose_path, sanitize=False, removeHs=False, proximityBonding=False)
-            # if pose_mol is None:
-            #     import pdb;pdb.set_trace()
-            # symbols, coords = self.reader.read(pose_path)
-            xyz_block = self.reader.to_xyz_block(pose_path)
-            pose_mol = Chem.MolFromXYZBlock(xyz_block)
-            if pose_mol is None:
-                import pdb;pdb.set_trace()
-            rdDetermineBonds.DetermineConnectivity(pose_mol)
-            seed_copy = Fragment(env.seed, env.seed.protections)
-            seed_copy.protect()
-            pose_mol = AllChem.AssignBondOrdersFromTemplate(seed_copy, pose_mol)
-            Chem.SanitizeMol(pose_mol)
-            Chem.SanitizeMol(seed_copy)
-            mcs = FindMCS([seed_copy, pose_mol])
-            if mcs.numAtoms != seed_copy.GetNumAtoms():
-                import pdb;pdb.set_trace()
-            seed_match = seed_copy.GetSubstructMatch(pose_mol)
-            # print('Seed', seed_match)
-            # print('Pose', pose_mol.GetSubstructMatch(seed_copy))
-            if len(seed_match) != mcs.numAtoms:
-                import pdb;pdb.set_trace()
-            
-            seed_conf = seed_copy.GetConformer()
-            pose_coords = pose_mol.GetConformer().GetPositions()
-            for pose_i, seed_i  in enumerate(seed_match):
-                coord = pose_coords[pose_i]
-                seed_symbol = seed_copy.GetAtomWithIdx(seed_i).GetSymbol()
-                pose_symbol = pose_mol.GetAtomWithIdx(pose_i).GetSymbol()
-                if seed_symbol != pose_symbol :
-                    import pdb;pdb.set_trace()
-                point = Point3D(*coord)
-                seed_conf.SetAtomPosition(seed_i, point)
-                
-            ligand = mols[i]
-            ligand_centroid = ligand.GetConformer().GetPositions().mean(0)
-            pose_centroid = seed_conf.GetPositions().mean(0)
-            centroid_distance = euclidean(ligand_centroid, pose_centroid)
-            if centroid_distance > 5:
-                import pdb;pdb.set_trace()
-                
-            try:
-                env.set_seed_coordinates(seed_copy)
-            except Exception as e:
-                print(type(e), str(e))
-                import pdb;pdb.set_trace()
-                
-            terminated = self.terminateds[env_i]
-            if terminated:
-                env.seed.protect()
-            else:
-                env.seed_to_frame()
-            
-        batch_rewards = [-score for score in relative_scores]
-        
+        # Truncation means that we have reached the maximum number of step
+        # The molecule is likely too big, so we penalize
         for i, (reward, truncated) in enumerate(zip(batch_rewards, batch_truncated)):
             if truncated:
                 batch_rewards[i] = -10.0
@@ -920,15 +669,22 @@ class BatchEnv():
         for env_i, reward in zip(self.ongoing_env_idxs, batch_rewards):
             if reward < 0: # there is a clash, or bad interaction, or too many atoms
                 self.terminateds[env_i] = True
+                
+        for env_i in self.ongoing_env_idxs:
+            env = self.envs[env_i]
+            terminated = self.terminateds[env_i]
+            if terminated:
+                env.seed.protect()
+            else:
+                env.seed_to_frame()
             
+        # Refresh the ongoing envs, that are the one not terminated
         self.ongoing_env_idxs = [i 
                                  for i, terminated in enumerate(self.terminateds) 
                                  if not terminated]
         logging.debug(self.ongoing_env_idxs)
         logging.debug(self.terminateds)
         
-        # batch_obs = Batch.from_data_list(batch_obs)
-        # return batch_obs, batch_reward, batch_terminated, batch_truncated, batch_info
         return batch_rewards, list(self.terminateds), batch_truncated, batch_info
     
     

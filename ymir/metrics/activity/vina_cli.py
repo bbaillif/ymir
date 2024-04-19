@@ -12,19 +12,92 @@ from ymir.params import (VINA_LIGANDS_DIRECTORY,
                          VINA_CONFIG_PATH,
                          VINA_CPUS,
                          VINA_SEED,
-                         VINA_PATH)
+                         VINA_PATH,
+                         VINA_MAPS_DIRECTORY)
 from multiprocessing import Pool, TimeoutError
 
-def run_vina(vina_cmd: list[str]):
+class VinaCommand():
+    
+    def __init__(self,
+                 vina_cmd: list[str],
+                 receptor_path: str,
+                 maps_path: str= VINA_MAPS_DIRECTORY) -> None:
+        self.vina_cmd = vina_cmd
+        self.receptor_path = receptor_path
+        self.maps_path = maps_path
+        
+    def to_map_writing(self):
+        
+        new_vina_cmd = list(self.vina_cmd)
+        
+        new_vina_cmd.append('--receptor')
+        new_vina_cmd.append(self.receptor_path)
+        
+        receptor_filename = self.receptor_path.split('/')[-1].replace('.pdbqt', '')
+        receptor_maps_dirpath = os.path.join(self.maps_path, receptor_filename)
+        new_vina_cmd.append('--write_maps')
+        new_vina_cmd.append(receptor_maps_dirpath)
+        
+        new_vina_cmd.append('--force_even_voxels')
+        
+        return new_vina_cmd
+    
+    
+    def to_map_loading(self):
+        
+        new_vina_cmd = list(self.vina_cmd)
+        
+        receptor_filename = self.receptor_path.split('/')[-1].replace('.pdbqt', '')
+        receptor_maps_dirpath = os.path.join(self.maps_path, receptor_filename)
+        new_vina_cmd.append('--maps')
+        new_vina_cmd.append(receptor_maps_dirpath)
+        
+        return new_vina_cmd
+
+
+# def to_map_writing(vina_cmd):
+    
+#     new_vina_cmd = []
+    
+#     receptor_maps_dirpath = None
+#     for i, e in (vina_cmd):
+#         if e == '--receptor':
+#             receptor_path = vina_cmd[i+1]
+#             receptor_filename = receptor_path.split('/')[-1].replace('.pdbqt', '')
+#             receptor_maps_dirpath = os.path.join(VINA_MAPS_DIRECTORY, receptor_filename)
+#             break
+#         else:
+#             new_vina_cmd.append(e)
+            
+#     assert receptor_maps_dirpath is not None
+    
+#     for e in vina_cmd[i+2:]:
+#         new_vina_cmd.append(e)
+        
+#     new_vina_cmd.append('--write_maps')
+#     new_vina_cmd.append(receptor_maps_dirpath)
+    
+#     return new_vina_cmd
+               
+
+def run_vina(vina_command: VinaCommand):
     score = 0
     try:
+        vina_cmd = vina_command.to_map_loading()
         vina_cmd = ' '.join(vina_cmd)
         completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
         stdout = completed_process.stdout.decode('utf-8')
         stderr = completed_process.stderr.decode('utf-8')
-        logging.info(stdout)
+        # logging.info(stdout)
         if len(stderr) > 2:
             logging.info(stderr)
+            vina_cmd = vina_command.to_map_writing()
+            vina_cmd = ' '.join(vina_cmd)
+            completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
+            stdout = completed_process.stdout.decode('utf-8')
+            stderr = completed_process.stderr.decode('utf-8')
+            if len(stderr) > 2:
+                logging.info(stderr)
         
         for line in stdout.split('\n'):
             if line.startswith('Estimated Free Energy of Binding   :'):
@@ -47,7 +120,7 @@ class VinaCLI():
                  seed: int = VINA_SEED,
                  config_path: str = VINA_CONFIG_PATH,
                  vina_path: str = VINA_PATH,
-                 verbosity: int = 2) -> None:
+                 verbosity: int = 0) -> None:
         self.score_only = score_only
         self.ligands_directory = ligands_directory
         self.output_directory = output_directory
@@ -83,38 +156,27 @@ class VinaCLI():
         ligand_paths = self.write_ligands(ligands)
         base_vina_cmd = self.get_base_vina_cmd()
         
-        vina_cmds = []
+        vina_commands = []
         for ligand_path, receptor_path, native_ligand in zip(ligand_paths, receptor_paths, native_ligands):
-            vina_cmd = self.get_ligand_vina_cmd(base_vina_cmd, 
-                                                receptor_path, 
-                                                native_ligand,
-                                                ligand_path)
-            vina_cmds.append(vina_cmd)
+            vina_command = self.get_ligand_vina_cmd(base_vina_cmd, 
+                                                    receptor_path, 
+                                                    native_ligand,
+                                                    ligand_path)
+            vina_commands.append(vina_command)
         
         logging.info('Run Vina CLI')
         scores = []
         try:
             with Pool(self.n_threads, maxtasksperchild=1) as pool:
-                results = pool.map_async(run_vina, vina_cmds)
+                results = pool.map_async(run_vina, vina_commands)
                 for score in results.get(timeout=10*len(ligands)):
                     scores.append(score)
                 pool.close()
                 pool.join()
         except TimeoutError:
             logging.info('Pool Timeout')
-            
-        # for vina_cmd in vina_cmds:
-        #     score = run_vina(vina_cmd)
-        #     scores.append(score)
-        # try:
-        #     with Pool(self.n_threads, maxtasksperchild=1) as pool:
-        #         results = pool.map_async(fake_fn, vina_cmds)
-        #         for r in results.get(timeout=2):
-        #             logging.info(r)
-        #         pool.close()
-        #         pool.join()
-        # except TimeoutError:
-        #     logging.info('Pool Timeout')
+        
+        assert len(scores) == len(ligands)
         
         return scores
             
@@ -151,8 +213,13 @@ class VinaCLI():
         vina_cmd = [self.vina_path,
                     # '--config', self.config_path, # might not work with Vina 1.2.5
                     '--cpu', str(1),
-                    '--local_only',
-                    '--verbosity', str(self.verbosity)]
+                    '--verbosity', str(self.verbosity),
+                    '--scoring', 'vinardo',]
+        
+        if self.score_only:
+            vina_cmd.append('--score_only')
+        else:
+            vina_cmd.append('--local_only')
         
         return vina_cmd
     
@@ -162,25 +229,30 @@ class VinaCLI():
                             receptor_path: str,
                             native_ligand: Mol,
                             ligand_path: str,
-                            box_padding: float = 15.0):
+                            box_padding: float = 15.0) -> VinaCommand:
         ligand_positions = native_ligand.GetConformer().GetPositions()
         center = (ligand_positions.max(axis=0) + ligand_positions.min(axis=0)) / 2
         
         ligand_size = ligand_positions.max(axis=0) - ligand_positions.min(axis=0)
         box_size = ligand_size + box_padding
         
+        receptor_filename = receptor_path.split('/')[-1].replace('.pdbqt', '')
+        receptor_maps_dirpath = os.path.join(VINA_MAPS_DIRECTORY, receptor_filename)
+        
         output_path = os.path.join(self.output_directory, 
                                    ligand_path.split('/')[-1].replace('.pdbqt', '_out.pdbqt'))
         vina_cmd = base_vina_cmd + ['--ligand', ligand_path,
                                     '--out', output_path,
-                                    '--receptor', receptor_path,
+                                    # '--receptor', receptor_path,
+                                    # '--maps', receptor_maps_dirpath,
                                     '--center_x', f'{center[0]:.3f}',
                                     '--center_y', f'{center[1]:.3f}',
                                     '--center_z', f'{center[2]:.3f}',
                                     '--size_x', f'{box_size[0]:.3f}',
                                     '--size_y', f'{box_size[1]:.3f}',
                                     '--size_z', f'{box_size[2]:.3f}',]
-        return vina_cmd
+        vina_command = VinaCommand(vina_cmd, receptor_path)
+        return vina_command
         
         
     # def set_config(self,
