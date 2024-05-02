@@ -13,7 +13,8 @@ from ymir.params import (CNN_RADIUS, N_INTERACTION_BLOCKS, L_MAX,
                          MOL_ID_EMBEDDING_SIZE,
                         NODE_Z_EMBEDDING_SIZE,
                         MIDDLE_LAYER_SIZE,
-                        MAX_NUMBER_TYPES)
+                        MAX_NUMBER_TYPES,
+                        NEIGHBOR_RADIUS)
 
 
 class InteractionBlock(torch.nn.Module):
@@ -143,7 +144,7 @@ class CNN(torch.nn.Module):
         for block_i, interaction_block in enumerate(self.interaction_blocks):
             
             if block_i == 0:
-                radius = 3
+                radius = NEIGHBOR_RADIUS
             else:
                 radius = self.max_radius
             

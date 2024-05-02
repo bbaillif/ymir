@@ -26,6 +26,16 @@ class VinaCommand():
         self.receptor_path = receptor_path
         self.maps_path = maps_path
         
+        
+    def to_receptor(self):
+        
+        new_vina_cmd = list(self.vina_cmd)
+        
+        new_vina_cmd.append('--receptor')
+        new_vina_cmd.append(self.receptor_path)
+        
+        return new_vina_cmd
+        
     def to_map_writing(self):
         
         new_vina_cmd = list(self.vina_cmd)
@@ -83,21 +93,29 @@ class VinaCommand():
 def run_vina(vina_command: VinaCommand):
     score = 0
     try:
-        vina_cmd = vina_command.to_map_loading()
+        vina_cmd = vina_command.to_receptor()
         vina_cmd = ' '.join(vina_cmd)
         completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
         stdout = completed_process.stdout.decode('utf-8')
         stderr = completed_process.stderr.decode('utf-8')
-        # logging.info(stdout)
         if len(stderr) > 2:
             logging.info(stderr)
-            vina_cmd = vina_command.to_map_writing()
-            vina_cmd = ' '.join(vina_cmd)
-            completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
-            stdout = completed_process.stdout.decode('utf-8')
-            stderr = completed_process.stderr.decode('utf-8')
-            if len(stderr) > 2:
-                logging.info(stderr)
+        
+        # vina_cmd = vina_command.to_map_loading()
+        # vina_cmd = ' '.join(vina_cmd)
+        # completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
+        # stdout = completed_process.stdout.decode('utf-8')
+        # stderr = completed_process.stderr.decode('utf-8')
+        # # logging.info(stdout)
+        # if len(stderr) > 2:
+        #     logging.info(stderr)
+        #     vina_cmd = vina_command.to_map_writing()
+        #     vina_cmd = ' '.join(vina_cmd)
+        #     completed_process = subprocess.run(vina_cmd, capture_output=True, shell=True, timeout=60)
+        #     stdout = completed_process.stdout.decode('utf-8')
+        #     stderr = completed_process.stderr.decode('utf-8')
+        #     if len(stderr) > 2:
+        #         logging.info(stderr)
         
         for line in stdout.split('\n'):
             if line.startswith('Estimated Free Energy of Binding   :'):
@@ -229,7 +247,7 @@ class VinaCLI():
                             receptor_path: str,
                             native_ligand: Mol,
                             ligand_path: str,
-                            box_padding: float = 15.0) -> VinaCommand:
+                            box_padding: float = 25.0) -> VinaCommand:
         ligand_positions = native_ligand.GetConformer().GetPositions()
         center = (ligand_positions.max(axis=0) + ligand_positions.min(axis=0)) / 2
         
@@ -245,12 +263,14 @@ class VinaCLI():
                                     '--out', output_path,
                                     # '--receptor', receptor_path,
                                     # '--maps', receptor_maps_dirpath,
-                                    '--center_x', f'{center[0]:.3f}',
-                                    '--center_y', f'{center[1]:.3f}',
-                                    '--center_z', f'{center[2]:.3f}',
-                                    '--size_x', f'{box_size[0]:.3f}',
-                                    '--size_y', f'{box_size[1]:.3f}',
-                                    '--size_z', f'{box_size[2]:.3f}',]
+                                    # '--center_x', f'{center[0]:.3f}',
+                                    # '--center_y', f'{center[1]:.3f}',
+                                    # '--center_z', f'{center[2]:.3f}',
+                                    # '--size_x', f'{box_size[0]:.3f}',
+                                    # '--size_y', f'{box_size[1]:.3f}',
+                                    # '--size_z', f'{box_size[2]:.3f}',
+                                    '--autobox'
+                                    ]
         vina_command = VinaCommand(vina_cmd, receptor_path)
         return vina_command
         

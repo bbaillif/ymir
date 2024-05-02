@@ -109,7 +109,7 @@ class FragmentLibrary():
         small_frags_3D: list[Fragment] = []
         for i, fragment in enumerate(tqdm(small_fragments)):
 
-            f = Fragment(fragment)
+            f = Fragment.from_fragment(fragment)
             if len(f.get_attach_points()) == 0:
                 import pdb;pdb.set_trace()
             f.protect()
@@ -141,8 +141,7 @@ class FragmentLibrary():
             attach_points = fragment.get_attach_points()
             if not 7 in list(attach_points.values()): # "7 double bond 7" reaction does not work for some reason...
                 for atom_id, label in attach_points.items():
-                    fragment_copy = copy.deepcopy(fragment)
-                    protected_fragment = Fragment(fragment_copy)
+                    protected_fragment = Fragment.from_fragment(fragment)
                     protected_fragment.protect(atom_ids_to_keep=[atom_id])
                     protected_fragments.append(protected_fragment)
         
@@ -151,15 +150,16 @@ class FragmentLibrary():
 
     def get_restricted_fragments(self,
                                  z_list: list[int],
-                                 max_attach: int = 10):
+                                 max_attach: int = 10,
+                                 max_torsions: int = 0,
+                                 n_fragments: int = None) -> list[Fragment]:
         protected_fragments = select_mol_with_symbols(self.protected_fragments,
                                               z_list)
 
         # Select only fragments with at most max_attach point
         n_attaches = []
         for fragment in protected_fragments:
-            frag_copy = Fragment(mol=fragment,
-                                protections=fragment.protections)
+            frag_copy = Fragment.from_fragment(fragment)
             frag_copy.unprotect()
             attach_points = frag_copy.get_attach_points()
             n_attach = len(attach_points)
@@ -171,13 +171,20 @@ class FragmentLibrary():
                 
         unique_fragments = []
         unique_smiles = []
-        for mol in protected_fragments:
+        for frag in protected_fragments:
+            mol = frag.to_mol()
             smiles = Chem.MolToSmiles(mol)
             if not smiles in unique_smiles:
                 unique_smiles.append(smiles)
-                unique_fragments.append(mol)
+                unique_fragments.append(frag)
                 
-        protected_fragments = unique_fragments
+        n_torsions = [CalcNumRotatableBonds(frag.to_mol()) for frag in unique_fragments]
+        unique_fragments = [frag for frag, n_torsion in zip(unique_fragments, n_torsions) if n_torsion <= max_torsions]
+            
+        if n_fragments is None:
+            protected_fragments = unique_fragments
+        else:
+            protected_fragments = unique_fragments[:n_fragments]
         
         return protected_fragments
     

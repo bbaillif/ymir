@@ -146,7 +146,7 @@ class Agent(nn.Module):
     
     def extract_features(self,
                          x: Batch):
-        # noise = torch.randn_like(x.pos) / 10 # variance of 0.1
+        # noise = torch.randn_like(x.pos) / 50 # variance of 0.1
         # noise = noise.to(x.pos)
         # x.pos = x.pos + noise
         features = self.pocket_feature_extractor(x)

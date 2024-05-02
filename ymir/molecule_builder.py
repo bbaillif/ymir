@@ -108,6 +108,9 @@ reactions = BRICS.reverseReactions
 def add_fragment_to_seed(seed: Fragment,
                          fragment: Fragment):
     
+    seed_mol = seed.to_mol()
+    frag_mol = fragment.to_mol()
+    
     seed_attach_points = seed.get_attach_points()
     assert len(seed_attach_points) == 1, 'There must be only one attach point on seed'
     
@@ -127,12 +130,12 @@ def add_fragment_to_seed(seed: Fragment,
     rxn = reactions[rxn_i]
     
     reactions_products = []
-    if fragment.HasSubstructMatch(rxn._matchers[0]):
-        if seed.HasSubstructMatch(rxn._matchers[1]):
-            reactions_products = rxn.RunReactants((fragment, seed))
-    elif fragment.HasSubstructMatch(rxn._matchers[1]):
-        if seed.HasSubstructMatch(rxn._matchers[0]):
-            reactions_products = rxn.RunReactants((seed, fragment))
+    if frag_mol.HasSubstructMatch(rxn._matchers[0]):
+        if seed_mol.HasSubstructMatch(rxn._matchers[1]):
+            reactions_products = rxn.RunReactants((frag_mol, seed_mol))
+    elif frag_mol.HasSubstructMatch(rxn._matchers[1]):
+        if seed_mol.HasSubstructMatch(rxn._matchers[0]):
+            reactions_products = rxn.RunReactants((seed_mol, frag_mol))
     
     try:
         assert len(reactions_products) == 1
@@ -144,14 +147,14 @@ def add_fragment_to_seed(seed: Fragment,
     product = products[0]
     
     product_positions = product.GetConformer().GetPositions()
-    seed_positions = seed.GetConformer().GetPositions()
+    seed_positions = seed_mol.GetConformer().GetPositions()
     
     dists = distance_matrix(seed_positions, product_positions)
     closest_product_id_in_seed = dists.argmin(axis=1)
     seed_to_product_mapping = {seed_id: int(product_id) 
                                 for seed_id, product_id in enumerate(closest_product_id_in_seed)}
 
-    fragment_positions = fragment.GetConformer().GetPositions()
+    fragment_positions = frag_mol.GetConformer().GetPositions()
     
     dists = distance_matrix(fragment_positions, product_positions)
     closest_product_id_in_frag = dists.argmin(axis=1)

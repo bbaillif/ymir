@@ -207,14 +207,15 @@ def center_fragment(fragment: Fragment,
                     attach_to_neighbor: bool = True,
                     neighbor_is_zero: bool = True) -> list[Union[np.ndarray, Rotation]]:
     assert len(fragment.get_attach_points()) == 1
-    for atom in fragment.GetAtoms():
+    mol = fragment.to_mol()
+    for atom in mol.GetAtoms():
         if atom.GetAtomicNum() == 0:
             attach_point = atom
             break
     neighbor = attach_point.GetNeighbors()[0]
     neighbor_id = neighbor.GetIdx()
     attach_id = attach_point.GetIdx()
-    positions = fragment.GetConformer().GetPositions()
+    positions = mol.GetConformer().GetPositions()
     # neighbor_attach = positions[[neighbor_id, attach_id]]
     # distance = euclidean(neighbor_attach[0], neighbor_attach[1])
     # x_axis_vector = np.array([[0,0,0], [distance,0,0]])
@@ -227,18 +228,19 @@ def center_fragment(fragment: Fragment,
     distance = euclidean(neighbor_pos, attach_pos)
     x_axis_vector = np.array([distance, 0, 0])
     # import pdb;pdb.set_trace()
-    rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=direction.reshape(-1, 3))
-    rotate_conformer(conformer=fragment.GetConformer(),
+    # rotation, rssd = Rotation.align_vectors(a=x_axis_vector.reshape(-1, 3), b=direction.reshape(-1, 3))
+    rotation, rssd = Rotation.align_vectors(a=x_axis_vector, b=direction)
+    rotate_conformer(conformer=mol.GetConformer(),
                         rotation=rotation)
     
-    positions = fragment.GetConformer().GetPositions()
+    positions = mol.GetConformer().GetPositions()
     if neighbor_is_zero:
         neighbor_pos = positions[neighbor_id]
         translation = -neighbor_pos
     else:
         attach_pos = positions[attach_id]
         translation = -attach_pos
-    translate_conformer(conformer=fragment.GetConformer(),
+    translate_conformer(conformer=mol.GetConformer(),
                         translation=translation)
     
     transformations = [rotation, translation]
@@ -248,7 +250,8 @@ def center_fragment(fragment: Fragment,
 def get_masks(final_fragments: list[Fragment]):
     fragment_attach_labels = []
     for act_i, fragment in enumerate(final_fragments):
-        for atom in fragment.GetAtoms():
+        mol = fragment.to_mol()
+        for atom in mol.GetAtoms():
             if atom.GetAtomicNum() == 0:
                 attach_label = atom.GetIsotope()
                 break
@@ -267,14 +270,13 @@ def get_masks(final_fragments: list[Fragment]):
 
 
 def select_mol_with_symbols(mols: list[Union[Mol, Fragment]],
-                            z_list: list[int]):
+                            z_list: list[int]) -> list[Union[Mol, Fragment]]:
     mol_is_included = []
     for mol in mols:
         if isinstance(mol, Fragment):
-            frag = Fragment(mol=mol,
-                            protections=mol.protections)
+            frag = Fragment.from_fragment(mol)
             frag.unprotect()
-            mol = frag
+            mol = frag.to_mol()
         mol = Chem.RemoveHs(mol)
         included = True
         for atom in mol.GetAtoms():
@@ -298,8 +300,7 @@ def get_rotated_fragments(protected_fragments,
     rotated_fragments = []
     for protected_fragment in tqdm(protected_fragments):
         for torsion_value in torsion_angles_deg:
-            new_fragment = Fragment(protected_fragment,
-                                    protections=protected_fragment.protections)
+            new_fragment = Fragment.from_fragment(protected_fragment)
             rotation = Rotation.from_euler('x', torsion_value)
             rotate_conformer(new_fragment.GetConformer(), rotation)
             rotated_fragments.append(new_fragment)
@@ -309,7 +310,7 @@ def get_rotated_fragments(protected_fragments,
 def get_neighbor_symbol(fragment: Fragment):
     aps = fragment.get_attach_points()
     ap_atom_id = list(aps.keys())[0]
-    ap_atom = fragment.GetAtomWithIdx(ap_atom_id)
+    ap_atom = fragment.to_mol().GetAtomWithIdx(ap_atom_id)
     neighbors = ap_atom.GetNeighbors()
     assert len(neighbors) == 1
     return neighbors[0].GetSymbol()

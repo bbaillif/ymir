@@ -35,6 +35,7 @@ from rdkit.Chem import rdDetermineBonds
 from rdkit.Chem import AllChem
 from scipy.spatial.distance import euclidean
 from ymir.complex_minimizer import ComplexMinimizer
+from ymir.save_state import StateSave, Memory
 
 
 class FragmentBuilderEnv():
@@ -78,8 +79,7 @@ class FragmentBuilderEnv():
               ) -> tuple[Data, dict[str, Any]]:
         
         self.complex = complx
-        self.seed = Fragment(seed,
-                             protections=seed.protections)
+        self.seed = Fragment.from_fragment(seed)
         # self.memory = memory
         self.initial_score = initial_score
         self.current_score = initial_score
@@ -88,10 +88,10 @@ class FragmentBuilderEnv():
         
         self.transformations = []
         
-        random_rotation = Rotation.random()
-        rotate_conformer(self.pocket_mol.GetConformer(), rotation=random_rotation)
-        rotate_conformer(self.seed.GetConformer(), rotation=random_rotation)
-        self.transformations.append(random_rotation)
+        # random_rotation = Rotation.random()
+        # rotate_conformer(self.pocket_mol.GetConformer(), rotation=random_rotation)
+        # rotate_conformer(self.seed.to_mol().GetConformer(), rotation=random_rotation)
+        # self.transformations.append(random_rotation)
         
         # self.original_seed = Chem.Mol(self.seed)
         
@@ -108,8 +108,7 @@ class FragmentBuilderEnv():
         
         self.actions = []
         
-        self.valid_action_mask = self.get_valid_action_mask()
-        has_valid_action = torch.any(self.valid_action_mask)
+        has_valid_action = torch.any(self.get_valid_action_mask())
         self.terminated = not has_valid_action
         
         # this should not happen, unless the set of fragments is 
@@ -117,7 +116,7 @@ class FragmentBuilderEnv():
         if self.terminated: 
             import pdb;pdb.set_trace()
         
-        self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
+        # self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
         
         # return observation, info
         return info
@@ -155,23 +154,29 @@ class FragmentBuilderEnv():
         construct_neighbor_symbol = get_neighbor_symbol(self.seed)
         fragment_neighbor_symbol = get_neighbor_symbol(fragment)
         distance = self.mbd.get_mbd(construct_neighbor_symbol, fragment_neighbor_symbol)
-        return distance # hard coded but should be modified
+        return distance
         
         
     def get_new_fragments(self,
-                        frag_action: int) -> list[Fragment]:
+                        frag_action: int,
+                        sample_rotations: bool) -> list[Fragment]:
         
         fragment_i = frag_action
         protected_fragment = self.protected_fragments[fragment_i]
         
-        rotations = []
-        for angle in range(-180, 180, 10):
-            rotation = Rotation.from_euler('x', angle, degrees=True)
-            rotations.append(rotation)
+        if sample_rotations:
         
-        new_fragments = [Fragment(protected_fragment, protected_fragment.protections) for _ in rotations]
-        for frag, rotation in zip(new_fragments, rotations):
-            rotate_conformer(frag.GetConformer(), rotation=rotation)
+            rotations = []
+            for angle in range(-180, 180, 5):
+                rotation = Rotation.from_euler('x', angle, degrees=True)
+                rotations.append(rotation)
+            
+            new_fragments = [Fragment.from_fragment(protected_fragment) for _ in rotations]
+            for frag, rotation in zip(new_fragments, rotations):
+                rotate_conformer(frag.to_mol().GetConformer(), rotation=rotation)
+                
+        else:
+            new_fragments = [Fragment.from_fragment(protected_fragment)]
 
         return new_fragments
         
@@ -183,7 +188,7 @@ class FragmentBuilderEnv():
         distance = self.get_seed_fragment_distance(added_fragment) # hard coded but should be modified
         
         translation = np.array([-distance, 0, 0])
-        translate_conformer(self.seed.GetConformer(), translation=translation)
+        translate_conformer(self.seed.to_mol().GetConformer(), translation=translation)
         translate_conformer(self.pocket_mol.GetConformer(), translation=translation)
         self.transformations.append(translation)
         
@@ -192,20 +197,27 @@ class FragmentBuilderEnv():
         # import pdb;pdb.set_trace()
         
         
-    def action_to_fragment_build(self,
-                                 frag_action: int) -> None:
+    def action_to_products(self,
+                            frag_action: int,
+                            sample_rotations: bool) -> list[Fragment]:
         
-        new_fragments = self.get_new_fragments(frag_action)
+        new_fragments = self.get_new_fragments(frag_action,
+                                               sample_rotations=sample_rotations)
         new_fragment = new_fragments[0]
         self.translate_seed(added_fragment=new_fragment)
         
         products = [add_fragment_to_seed(seed=self.seed,
                                         fragment=new_fragment)
                     for new_fragment in new_fragments]
-        product_clash = [self.get_pocket_ligand_clash(product) for product in products]
+        product_clash = [self.get_pocket_ligand_clash(product.to_mol()) for product in products]
         
         default_product = products[0]
         products = [product for product, clash in zip(products, product_clash) if not clash]
+        
+        if len(products) == 0:
+            products = [default_product]
+        
+        return products
         
         if len(products) > 0:
         
@@ -214,7 +226,7 @@ class FragmentBuilderEnv():
                             for _ in products]
             native_ligands = [self.complex.ligand for _ in products]
             frags = [Fragment(product, product.protections) for product in products]
-            mols = [self.get_clean_mol(frag) for frag in frags]
+            mols = [self.get_clean_fragment(frag) for frag in frags]
             scores = vina_cli.get(receptor_paths=receptor_paths,
                                 native_ligands=native_ligands,
                                 ligands=mols)
@@ -315,60 +327,70 @@ class FragmentBuilderEnv():
             terminated = True
             self.focal_atom_id = None
         else:
-            self.focal_atom_id = np.random.choice(list(self.attach_points.keys()))
+            # self.focal_atom_id = np.random.choice(list(self.attach_points.keys()))
+            # to ensure it is deterministic to work with the memory of the BatchEnv
+            self.focal_atom_id = list(self.attach_points.keys())[0]
             self.seed.protect(atom_ids_to_keep=[self.focal_atom_id])
+            assert (len(self.seed.get_attach_points()) == 1)
         return terminated
     
     
-    def step(self,
-             frag_action: int):
-        
+    def initiate_step(self,
+                      frag_action: int,
+                      sample_rotations: bool = True):
         self.actions.append(frag_action)
-        n_actions = len(self.actions)
+        products = self.action_to_products(frag_action,
+                                           sample_rotations) # seed is deprotected
+        return products
+    
+    
+    def step(self,
+             product: Fragment,
+             score: float):
         
-        reward = self.action_to_fragment_build(frag_action) # seed is deprotected
-        
-        if n_actions == self.max_episode_steps: # not terminated but reaching max step size
-            self.truncated = True
-            # We replace the focal atom with hydrogen (= protect)
-            # all other attachment points are already protected
-            self.seed.protect() 
-        elif not self.terminated:
-            self.valid_action_mask = torch.tensor(self.get_valid_action_mask())
-            
-            # # we terminate the generation if there is no valid action (due to clash)
-            # has_valid_action = torch.any(self.valid_action_mask)
-            # self.terminated = not has_valid_action
-            # if self.terminated:
-            #     logging.info('We have an environment with only clashing fragments')
-            #     self.seed.protect()
-            #     reward = -100 # it is actually a clash penalty
-        
-        if self.terminated or self.truncated:
-            assert(all([atom.GetAtomicNum() > 0 for atom in self.seed.GetAtoms()]))
+        self.seed = product
+        self.current_score = score
         
         # observation = self._get_obs()
         info = self._get_info()
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
+        n_actions = len(self.actions)
+        if (n_actions == self.max_episode_steps) and (not self.terminated): # not terminated but reaching max step size
+            self.truncated = True
+            # We replace the focal atom with hydrogen (= protect)
+            # all other attachment points are already protected
+            self.seed.protect() 
+        
+        if self.terminated or self.truncated:
+            assert(all([atom.GetAtomicNum() > 0 for atom in self.seed.to_mol().GetAtoms()]))
+        
         # return observation, reward, self.terminated, self.truncated, info
-        return reward, self.terminated, self.truncated, info
+        return self.terminated, self.truncated, info
     
     
-    def set_seed_coordinates(self,
-                             pose_mol):
-        pose_conformer = pose_mol.GetConformer()
-        for transformation in self.transformations:
-            if isinstance(transformation, Rotation):
-                rotate_conformer(pose_conformer, transformation)
-            else:
-                translate_conformer(pose_conformer, transformation)
-        pose_coordinates = pose_conformer.GetPositions()
-        seed_conformer = self.seed.GetConformer()
-        for i, new_pos in enumerate(pose_coordinates):
-            point = Point3D(*new_pos)
-            seed_conformer.SetAtomPosition(i, point)
+    def step_from_state_save(self,
+                             state_save: StateSave):
+        self.pocket_mol = Mol(state_save.pocket_mol)
+        self.transformations = list(state_save.transformations)
+        t = self.step(product=Fragment.from_fragment(state_save.seed), score=float(state_save.score))
+        return t
+    
+    
+    # def set_seed_coordinates(self,
+    #                          pose_mol):
+    #     pose_conformer = pose_mol.GetConformer()
+    #     for transformation in self.transformations:
+    #         if isinstance(transformation, Rotation):
+    #             rotate_conformer(pose_conformer, transformation)
+    #         else:
+    #             translate_conformer(pose_conformer, transformation)
+    #     pose_coordinates = pose_conformer.GetPositions()
+    #     seed_conformer = self.seed.to_mol().GetConformer()
+    #     for i, new_pos in enumerate(pose_coordinates):
+    #         point = Point3D(*new_pos)
+    #         seed_conformer.SetAtomPosition(i, point)
     
     
     def get_valid_action_mask(self):
@@ -524,12 +546,13 @@ class FragmentBuilderEnv():
                     
         return has_clash
     
-    def get_clean_mol(self,
-                      ligand: Mol):
-        frag = Fragment(ligand, protections=ligand.protections)
-        frag.protect()
-        Chem.SanitizeMol(frag)
-        mol = Chem.RemoveHs(frag)
+    def get_clean_fragment(self,
+                      fragment: Fragment):
+        clean_frag = Fragment.from_fragment(fragment)
+        clean_frag.protect()
+        mol = clean_frag.to_mol()
+        Chem.SanitizeMol(mol)
+        mol = Chem.RemoveHs(mol)
         mol_h = Chem.AddHs(mol, addCoords=True)
         # mol_h = Mol(frag)
         
@@ -563,18 +586,19 @@ class FragmentBuilderEnv():
     
     
     def get_minimized_mol(self):
-        mol = self.get_clean_mol(self.seed)
+        mol = self.get_clean_fragment(self.seed)
         mini_mol = self.complex_minimizer.minimize_ligand(mol, 
                                                         #   distance_constraint=1
                                                           )
         return mini_mol
     
     
+    
 class BatchEnv():
     
     def __init__(self,
                  envs: list[FragmentBuilderEnv],
-                 memory: dict) -> None:
+                 memory: Memory) -> None:
         self.envs = envs
         self.memory = memory
         self.vina_cli = VinaCLI()
@@ -585,6 +609,7 @@ class BatchEnv():
               complexes: list[Complex],
               seeds: list[Fragment],
               initial_scores: list[float],
+              seed_idxs: list[int],
               absolute_scores: list[float] = None) -> tuple[list[Data], list[dict[str, Any]]]:
         # batch_obs: list[Data] = []
         assert len(complexes) == len(self.envs)
@@ -612,6 +637,8 @@ class BatchEnv():
         
         self.current_scores = initial_scores
         self.absolute_scores = absolute_scores
+        
+        self.seed_idxs = seed_idxs
         
         return batch_info
     
@@ -644,20 +671,105 @@ class BatchEnv():
         
         assert frag_actions.size()[0] == len(self.ongoing_env_idxs)
 
-        batch_truncated = []
-        batch_info = []
-        batch_rewards = []
+        # Prepare step: iterate on rotations for the selected fragment
+        all_products = []
+        all_clean_mols = []
+        batch_indices = []
+        receptor_paths = []
+        native_ligands = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             frag_action = int(frag_action)
-            reward, terminated, truncated, info = env.step(frag_action)
+            
+            state_action = (self.seed_idxs[env_i], *env.actions, frag_action)
+            sample_rotations = not (state_action in self.memory)
+            products = env.initiate_step(frag_action,
+                                         sample_rotations) # adds actions to env.actions
+            
+            # Compute score if not in memory
+            if sample_rotations:
+                idx = [env_i] * len(products)
+                all_products.extend(products)
+                batch_indices.extend(idx)
+                
+                receptor_paths.extend([env.complex.vina_protein.pdbqt_filepath] * len(products))
+                native_ligands.extend([env.complex.ligand] * len(products))
+                all_clean_mols.extend([env.get_clean_fragment(product) for product in products])
+            
+        # Compute score for all subfragments
+        if len(batch_indices) > 0:
+            vina_cli = VinaCLI()
+            scores = vina_cli.get(receptor_paths=receptor_paths,
+                                    native_ligands=native_ligands,
+                                    ligands=all_clean_mols)
+            scores = np.array(scores)
+        
+        # Select the subfragment with the best score
+        batch_truncated = []
+        batch_rewards = []
+        batch_info = []
+        for env_i in self.ongoing_env_idxs:
+            env = self.envs[env_i]
+            state_action = (self.seed_idxs[env_i], *env.actions)
+            
+            if state_action in self.memory:
+                state_save = self.memory[state_action]
+                env_score = state_save.score
+                product = state_save.seed
+                env_relative_score = env_score - env.current_score
+                env_reward = -env_relative_score
+                terminated, truncated, info = env.step_from_state_save(state_save)
+            else:
+                env_indices = [i for i, idx in enumerate(batch_indices) if idx == env_i]
+                env_scores = scores[env_indices]
+                max_i = np.argmax(env_scores)
+                # env_relative_scores = env_scores - env.current_score
+                # env_rewards = [-score for score in env_relative_scores]
+                # max_i = np.argmax(env_rewards)
+                env_score = env_scores[max_i]
+                env_relative_score = env_score - env.current_score
+                env_reward = -env_relative_score
+                env_products = [product for product, idx in zip(all_products, batch_indices) if idx == env_i]
+                product = env_products[max_i]
+                save_state = StateSave(score=float(env_score),
+                                        seed=Fragment.from_fragment(product),
+                                        pocket_mol=Mol(env.pocket_mol),
+                                        transformations=list(env.transformations))
+                self.memory[state_action] = save_state
+                terminated, truncated, info = env.step(product, env_score)
             
             if terminated: # we have no attachment points left
                 self.terminateds[env_i] = True
             
+            # env_reward = env_rewards[max_i]
+            
+            if product.to_mol().GetNumHeavyAtoms() > 50:
+                env_reward = env_reward - 10
+            
+            batch_rewards.append(env_reward)
             batch_truncated.append(truncated)
             batch_info.append(info)
-            batch_rewards.append(reward)
+                
+
+        # batch_truncated = []
+        # batch_info = []
+        # batch_rewards = []
+        # for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
+        #     env = self.envs[env_i]
+        #     frag_action = int(frag_action)
+            
+        #     products = env.initiate_step(frag_action)
+            
+            
+            
+        #     reward, terminated, truncated, info = env.step(frag_action)
+            
+        #     if terminated: # we have no attachment points left
+        #         self.terminateds[env_i] = True
+            
+        #     batch_truncated.append(truncated)
+        #     batch_info.append(info)
+        #     batch_rewards.append(reward)
         
         # Truncation means that we have reached the maximum number of step
         # The molecule is likely too big, so we penalize
@@ -667,7 +779,7 @@ class BatchEnv():
         
         # this will cause truncation to extend to termination
         for env_i, reward in zip(self.ongoing_env_idxs, batch_rewards):
-            if reward < 0: # there is a clash, or bad interaction, or too many atoms
+            if reward < -1: # there is a clash, or bad interaction, or too many atoms
                 self.terminateds[env_i] = True
                 
         for env_i in self.ongoing_env_idxs:
@@ -676,7 +788,10 @@ class BatchEnv():
             if terminated:
                 env.seed.protect()
             else:
-                env.seed_to_frame()
+                try:
+                    env.seed_to_frame()
+                except:
+                    import pdb;pdb.set_trace()
             
         # Refresh the ongoing envs, that are the one not terminated
         self.ongoing_env_idxs = [i 
@@ -685,14 +800,16 @@ class BatchEnv():
         logging.debug(self.ongoing_env_idxs)
         logging.debug(self.terminateds)
         
+        logging.info(f'Memory size: {len(self.memory)}')
+        
         return batch_rewards, list(self.terminateds), batch_truncated, batch_info
     
     
-    def get_clean_mols(self) -> list[Mol]:
+    def get_clean_fragments(self) -> list[Mol]:
         
         mols = []
         for env in self.envs:
-            mol_h = env.get_clean_mol(env.seed)
+            mol_h = env.get_clean_fragment(env.seed)
             mols.append(mol_h)
         return mols
             
@@ -713,23 +830,52 @@ class BatchEnv():
     
     def save_state(self) -> None:
         
-        save_path = 'ligands.sdf' 
-        with Chem.SDWriter(save_path) as ligand_writer:
-            for env in self.envs:
-                mol_h = env.get_clean_mol(env.seed)
-                ligand_writer.write(mol_h)
-              
+        ligand_path = 'ligands.sdf' 
+        ligand_writer = Chem.SDWriter(ligand_path)
+        
         pocket_path = 'pockets.sdf'  
-        with Chem.SDWriter(pocket_path) as pocket_writer:
-            for env in self.envs:
-                clean_pocket = env.get_clean_pocket()
-                pocket_writer.write(clean_pocket)
-                
+        pocket_writer = Chem.SDWriter(pocket_path)
+        
         native_ligand_path = 'native_ligands.sdf'
-        with Chem.SDWriter(native_ligand_path) as native_writer:
-            for env in self.envs:
-                native_ligand = env.complex.ligand
-                native_writer.write(native_ligand)
+        native_writer = Chem.SDWriter(native_ligand_path)
+        
+        for env in self.envs:
+            mol_h = env.get_clean_fragment(env.seed)
+            ligand_writer.write(mol_h)
+            
+            clean_pocket = env.get_clean_pocket()
+            pocket_writer.write(clean_pocket)
+            
+            native_ligand = env.complex.ligand
+            native_writer.write(native_ligand)
+            
+            ligand_positions = mol_h.GetConformer().GetPositions()
+            native_positions = native_ligand.GetConformer().GetPositions()
+            distance_matrix = cdist(ligand_positions, native_positions)
+            min_distance = distance_matrix.min()
+            if min_distance > 0.01:
+                import pdb;pdb.set_trace()
+                
+        ligand_writer.close()
+        pocket_writer.close()
+        native_writer.close()
+            
+        # with Chem.SDWriter(save_path) as ligand_writer:
+        #     for env in self.envs:
+        #         mol_h = env.get_clean_fragment(env.seed)
+        #         ligand_writer.write(mol_h)
+              
+        
+        # with Chem.SDWriter(pocket_path) as pocket_writer:
+        #     for env in self.envs:
+        #         clean_pocket = env.get_clean_pocket()
+        #         pocket_writer.write(clean_pocket)
+                
+        # native_ligand_path = 'native_ligands.sdf'
+        # with Chem.SDWriter(native_ligand_path) as native_writer:
+        #     for env in self.envs:
+        #         native_ligand = env.complex.ligand
+        #         native_writer.write(native_ligand)
                 
         # with Chem.SDWriter('pocket.sdf') as writer:   
         #     writer.write(env.complex.pocket.mol)
