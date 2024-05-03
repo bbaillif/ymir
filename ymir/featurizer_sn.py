@@ -93,11 +93,11 @@ class Featurizer():
         frag_copy.unprotect()
         mol = frag_copy.to_mol()
         x, pos, is_focal = self.get_mol_features(mol=mol, 
-                                        center_pos=center_pos,
-                                        embed_hydrogens=embed_hydrogens,
-                                        max_radius=max_radius,
-                                        focal_id=focal_id,
-                                        neighbor_radius=neighbor_radius)
+                                                center_pos=center_pos,
+                                                embed_hydrogens=embed_hydrogens,
+                                                max_radius=max_radius,
+                                                focal_id=focal_id,
+                                                neighbor_radius=neighbor_radius)
         
         return x, pos, is_focal
     

@@ -302,7 +302,7 @@ def get_rotated_fragments(protected_fragments,
         for torsion_value in torsion_angles_deg:
             new_fragment = Fragment.from_fragment(protected_fragment)
             rotation = Rotation.from_euler('x', torsion_value)
-            rotate_conformer(new_fragment.GetConformer(), rotation)
+            rotate_conformer(new_fragment.to_mol().GetConformer(), rotation)
             rotated_fragments.append(new_fragment)
             
     return rotated_fragments

@@ -547,7 +547,8 @@ class FragmentBuilderEnv():
         return has_clash
     
     def get_clean_fragment(self,
-                      fragment: Fragment):
+                            fragment: Fragment,
+                            reverse_transformations: bool = True):
         clean_frag = Fragment.from_fragment(fragment)
         clean_frag.protect()
         mol = clean_frag.to_mol()
@@ -556,31 +557,34 @@ class FragmentBuilderEnv():
         mol_h = Chem.AddHs(mol, addCoords=True)
         # mol_h = Mol(frag)
         
-        for transformation in reversed(self.transformations):
-            if isinstance(transformation, Rotation):
-                rotation_inv = transformation.inv()
-                rotate_conformer(mol_h.GetConformer(), rotation=rotation_inv)
-            elif isinstance(transformation, np.ndarray):
-                translation_inv = -transformation
-                translate_conformer(mol_h.GetConformer(), translation=translation_inv)
-            else:
-                import pdb;pdb.set_trace()
+        if reverse_transformations:
+            for transformation in reversed(self.transformations):
+                if isinstance(transformation, Rotation):
+                    rotation_inv = transformation.inv()
+                    rotate_conformer(mol_h.GetConformer(), rotation=rotation_inv)
+                elif isinstance(transformation, np.ndarray):
+                    translation_inv = -transformation
+                    translate_conformer(mol_h.GetConformer(), translation=translation_inv)
+                else:
+                    import pdb;pdb.set_trace()
         
         return mol_h
     
     
-    def get_clean_pocket(self):
+    def get_clean_pocket(self,
+                         reverse_transformations: bool = True):
         
         new_mol = Mol(self.pocket_mol)
-        for transformation in reversed(self.transformations):
-            if isinstance(transformation, Rotation):
-                rotation_inv = transformation.inv()
-                rotate_conformer(new_mol.GetConformer(), rotation=rotation_inv)
-            elif isinstance(transformation, np.ndarray):
-                translation_inv = -transformation
-                translate_conformer(new_mol.GetConformer(), translation=translation_inv)
-            else:
-                import pdb;pdb.set_trace()
+        if reverse_transformations:
+            for transformation in reversed(self.transformations):
+                if isinstance(transformation, Rotation):
+                    rotation_inv = transformation.inv()
+                    rotate_conformer(new_mol.GetConformer(), rotation=rotation_inv)
+                elif isinstance(transformation, np.ndarray):
+                    translation_inv = -transformation
+                    translate_conformer(new_mol.GetConformer(), translation=translation_inv)
+                else:
+                    import pdb;pdb.set_trace()
                 
         return new_mol
     
@@ -682,12 +686,11 @@ class BatchEnv():
             frag_action = int(frag_action)
             
             state_action = (self.seed_idxs[env_i], *env.actions, frag_action)
-            sample_rotations = not (state_action in self.memory)
             products = env.initiate_step(frag_action,
-                                         sample_rotations) # adds actions to env.actions
+                                         sample_rotations=False) # adds actions to env.actions
             
             # Compute score if not in memory
-            if sample_rotations:
+            if not state_action in self.memory:
                 idx = [env_i] * len(products)
                 all_products.extend(products)
                 batch_indices.extend(idx)
@@ -695,6 +698,7 @@ class BatchEnv():
                 receptor_paths.extend([env.complex.vina_protein.pdbqt_filepath] * len(products))
                 native_ligands.extend([env.complex.ligand] * len(products))
                 all_clean_mols.extend([env.get_clean_fragment(product) for product in products])
+                
             
         # Compute score for all subfragments
         if len(batch_indices) > 0:
@@ -745,6 +749,8 @@ class BatchEnv():
             
             if product.to_mol().GetNumHeavyAtoms() > 50:
                 env_reward = env_reward - 10
+            
+            env_reward = env_reward + (len(env.actions) - 1) * 0.5
             
             batch_rewards.append(env_reward)
             batch_truncated.append(truncated)
@@ -828,7 +834,8 @@ class BatchEnv():
         return obs_list
     
     
-    def save_state(self) -> None:
+    def save_state(self,
+                   reverse_transformations: bool = False) -> None:
         
         ligand_path = 'ligands.sdf' 
         ligand_writer = Chem.SDWriter(ligand_path)
@@ -840,21 +847,32 @@ class BatchEnv():
         native_writer = Chem.SDWriter(native_ligand_path)
         
         for env in self.envs:
-            mol_h = env.get_clean_fragment(env.seed)
+            mol_h = env.get_clean_fragment(env.seed,
+                                           reverse_transformations)
             ligand_writer.write(mol_h)
             
-            clean_pocket = env.get_clean_pocket()
+            clean_pocket = env.get_clean_pocket(reverse_transformations)
             pocket_writer.write(clean_pocket)
             
-            native_ligand = env.complex.ligand
-            native_writer.write(native_ligand)
+            native_ligand = Mol(env.complex.ligand)
             
-            ligand_positions = mol_h.GetConformer().GetPositions()
-            native_positions = native_ligand.GetConformer().GetPositions()
-            distance_matrix = cdist(ligand_positions, native_positions)
-            min_distance = distance_matrix.min()
-            if min_distance > 0.01:
-                import pdb;pdb.set_trace()
+            if reverse_transformations:
+                # Check if we have effectively returned to the original frame
+                ligand_positions = mol_h.GetConformer().GetPositions()
+                native_positions = native_ligand.GetConformer().GetPositions()
+                distance_matrix = cdist(ligand_positions, native_positions)
+                min_distance = distance_matrix.min()
+                if min_distance > 0.01:
+                    import pdb;pdb.set_trace()
+            else:
+                # Apply the transformations to the native ligand
+                for transformation in env.transformations:
+                    if isinstance(transformation, Rotation):
+                        rotate_conformer(native_ligand.GetConformer(), rotation=transformation)
+                    else:
+                        translate_conformer(native_ligand.GetConformer(), translation=transformation)
+                    
+            native_writer.write(native_ligand)
                 
         ligand_writer.close()
         pocket_writer.close()

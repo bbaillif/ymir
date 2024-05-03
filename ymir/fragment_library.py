@@ -1,5 +1,6 @@
 import os
 import copy
+import random
 
 from tqdm import tqdm
 from rdkit import Chem
@@ -152,7 +153,14 @@ class FragmentLibrary():
                                  z_list: list[int],
                                  max_attach: int = 10,
                                  max_torsions: int = 0,
-                                 n_fragments: int = None) -> list[Fragment]:
+                                 n_fragments: int = None,
+                                 get_unique: bool = False,
+                                 shuffle: bool = True) -> list[Fragment]:
+        
+        if shuffle:
+            protected_fragments = copy.deepcopy(self.protected_fragments)
+            random.shuffle(protected_fragments)
+        
         protected_fragments = select_mol_with_symbols(self.protected_fragments,
                                               z_list)
 
@@ -169,23 +177,24 @@ class FragmentLibrary():
                             for fragment, n in zip(protected_fragments, n_attaches)
                             if n <= max_attach]
                 
-        unique_fragments = []
-        unique_smiles = []
-        for frag in protected_fragments:
-            mol = frag.to_mol()
-            smiles = Chem.MolToSmiles(mol)
-            if not smiles in unique_smiles:
-                unique_smiles.append(smiles)
-                unique_fragments.append(frag)
-                
-        n_torsions = [CalcNumRotatableBonds(frag.to_mol()) for frag in unique_fragments]
-        unique_fragments = [frag for frag, n_torsion in zip(unique_fragments, n_torsions) if n_torsion <= max_torsions]
-            
-        if n_fragments is None:
+        if get_unique:
+            unique_fragments = []
+            unique_smiles = []
+            for frag in protected_fragments:
+                mol = frag.to_mol()
+                smiles = Chem.MolToSmiles(mol)
+                if not smiles in unique_smiles:
+                    unique_smiles.append(smiles)
+                    unique_fragments.append(frag)
+                    
             protected_fragments = unique_fragments
-        else:
-            protected_fragments = unique_fragments[:n_fragments]
-        
+            
+        n_torsions = [CalcNumRotatableBonds(frag.to_mol()) for frag in protected_fragments]
+        protected_fragments = [frag for frag, n_torsion in zip(protected_fragments, n_torsions) if n_torsion <= max_torsions]
+            
+        if n_fragments is not None:
+            protected_fragments = protected_fragments[:n_fragments]
+            
         return protected_fragments
     
     

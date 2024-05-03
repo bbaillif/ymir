@@ -14,6 +14,8 @@ from ymir.data.fragment import Fragment
 from torch_geometric.data import Batch
 from ymir.model import CNN
 from torch_scatter import scatter
+from ymir.featurizer_sn import Featurizer
+from torch_geometric.data import Data
     
 class Action(NamedTuple): 
     frag_i: torch.Tensor # (batch_size)
@@ -104,35 +106,41 @@ class Agent(nn.Module):
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
         
-        self.pocket_feature_extractor = CNN(hidden_irreps=self.hidden_irreps,
-                                            irreps_output=self.irreps_output,
+        data_list = []
+        featurizer = Featurizer(z_table=self.z_table)
+        for fragment in self.protected_fragments:
+            x, pos, is_focal = featurizer.get_fragment_features(fragment=fragment, 
+                                                                embed_hydrogens=self.embed_hydrogens,
+                                                                center_pos=[0, 0, 0])
+            
+            x = torch.tensor(x, dtype=torch.long)
+            pos = torch.tensor(pos, dtype=torch.float)
+            is_focal = torch.tensor(is_focal, dtype=torch.bool)
+            mol_id = torch.tensor([2] * len(x), dtype=torch.long)
+            data = Data(x=x, 
+                        pos=pos,
+                        mol_id=mol_id,
+                        is_focal=is_focal)
+            data_list.append(data)
+        self.fragment_batch = Batch.from_data_list(data_list)
+        self.fragment_batch = self.fragment_batch.to(self.device)
+        
+        self.pocket_irreps = o3.Irreps(f'1x0e + 16x1o + 16x2e')
+        self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'32x1o + 32x2e'),
+                                            irreps_output=self.pocket_irreps,
                                              num_elements=len(self.z_table))
         
-        assert(len(self.irreps_output) == 1) # only invariant features
-        self.inv_features_dim = self.irreps_output.dim
-        hidden_dims = [self.inv_features_dim * 2, 
-                    #    self.inv_features_dim, 
-                    #    self.inv_features_dim // 2
-                       ]
-        self.actor = MultiLinear(input_dim=self.inv_features_dim, 
-                                 hidden_dims=hidden_dims,
-                                 output_dim=self.action_dim)
+        fragment_irreps = o3.Irreps(f'8x1o + 8x2e')
+        self.fragment_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'16x1o + 16x2e'),
+                                              irreps_output=fragment_irreps,
+                                              num_elements=len(self.z_table))
         
-        self.critic = MultiLinear(input_dim=self.inv_features_dim, 
-                                 hidden_dims=hidden_dims,
-                                 output_dim=1)
-        
-        
-        # hidden_dims = [self.features_dim * 2, 
-        #                self.features_dim,
-        #                self.features_dim // 2]
-        # self.actor = MultiLinear(input_dim=self.features_dim, 
-        #                          hidden_dims=hidden_dims,
-        #                          output_dim=self.action_dim)
-        
-        # self.critic = MultiLinear(input_dim=self.features_dim, 
-        #                          hidden_dims=hidden_dims,
-        #                          output_dim=1)
+        actor_irreps = o3.Irreps(f'1x0e')
+        self.actor_tp = o3.FullyConnectedTensorProduct(irreps_in1=self.pocket_irreps[1:], 
+                                                            irreps_in2=fragment_irreps, 
+                                                            irreps_out=actor_irreps, 
+                                                            internal_weights=True)
+        self.actor_tp.to(self.device)
 
 
     def forward(self, 
@@ -152,15 +160,37 @@ class Agent(nn.Module):
         features = self.pocket_feature_extractor(x)
         return features
     
+    
+    def extract_fragment_features(self):
+        features = self.fragment_feature_extractor(self.fragment_batch)
+        return features
+    
 
     def get_action(self, 
                    features: torch.Tensor, # (n_nodes, irreps_pocket_features)
+                   fragment_features: torch.Tensor,
                    masks: torch.Tensor = None, # (n_pockets, n_fragments)
                    frag_actions: torch.Tensor = None # (action_dim),
                    ) -> Action:
             
-        # inv_features, equi_features = self.split_features(features, self.hidden_irreps)
-        frag_logits = self.actor(features)
+        inv_features, equi_features = self.split_features(features, self.pocket_irreps)
+        
+        n_pockets = equi_features.shape[0]
+        n_fragments = fragment_features.shape[0]
+        # [pocket1, pocket1, ..., pocket2..., pocketi] * n_fragment
+        pocket_indices = torch.arange(n_pockets)
+        pocket_indices = torch.repeat_interleave(pocket_indices, n_fragments)
+        pocket_embeddings = equi_features[pocket_indices] # (n_pocket*n_rotations*n_fragments, irreps_dim)
+        
+        # [fragment1, fragment2, fragment3,..., fragmentn-1, fragmentn]
+        fragment_indices = torch.arange(n_fragments)
+        fragment_indices = fragment_indices.repeat(n_pockets)
+        fragment_embeddings = fragment_features[fragment_indices]
+        
+        actor_output = self.actor_tp(pocket_embeddings, fragment_embeddings)
+        
+        frag_logits = actor_output.reshape(n_pockets, n_fragments)
+        
         # frag_logits = torch.tanh(frag_logits)
         # frag_logits = frag_logits * 4 # from [-1;1] to [-3;3]
         # if 2000 fragments, the maximum prob will be exp(3) / (exp(-3) *700 + exp(3)) = 0.30
@@ -188,10 +218,10 @@ class Agent(nn.Module):
     def get_value(self, 
                   features: torch.Tensor,
                   ) -> torch.Tensor:
-        # inv_features, equi_features = self.split_features(features, self.hidden_irreps)
+        inv_features, equi_features = self.split_features(features, self.pocket_irreps)
         # critic_output = self.critic(inv_features)
-        critic_output = self.critic(features)
-        value = critic_output.squeeze(-1)
+        # critic_output = self.critic(features)
+        value = inv_features.squeeze(-1)
         return value
     
     

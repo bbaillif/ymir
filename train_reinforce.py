@@ -23,6 +23,7 @@ from ymir.fragment_library import FragmentLibrary
 from ymir.data.structure import Complex
 from ymir.utils.fragment import (get_seeds, 
                                  center_fragments, 
+                                 get_rotated_fragments,
                                  get_masks,
                                  select_mol_with_symbols,
                                  ConstructionSeed)
@@ -38,7 +39,8 @@ from ymir.params import (EMBED_HYDROGENS,
                          SEED,
                          VINA_DATASET_PATH,
                          POCKET_RADIUS,
-                         NEIGHBOR_RADIUS)
+                         NEIGHBOR_RADIUS,
+                         TORSION_ANGLES_DEG)
 from ymir.metrics.activity import VinaScore, VinaScorer
 from ymir.metrics.activity.vina_cli import VinaCLI
 from regressor import SOAPFeaturizer, GraphFeaturizer
@@ -64,7 +66,7 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 32 # we will have protein envs in parallel
+n_envs = 8 # we will have protein envs in parallel
 batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
 n_steps = 10 # number of maximum fragment growing
 # lr = 5e-4
@@ -75,7 +77,7 @@ device = torch.device('cuda')
 # ent_coef = 0.1
 ent_coef = 0.10
 
-use_entropy_loss = True
+use_entropy_loss = False
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v1_{timestamp}"
@@ -103,7 +105,7 @@ ligands = fragment_library.get_restricted_ligands(z_list)
 ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
 # print([ligand.GetProp('_Name') for ligand in ligands[:50]])
 # ligands = ligands[30:]
-ligands = random.sample(ligands, 100)
+ligands = random.sample(ligands, 10)
 
 # Remove fragment having at least one heavy atom not in list
 protected_fragments = fragment_library.get_restricted_fragments(z_list, max_attach=2, n_fragments=100)
@@ -185,9 +187,9 @@ initial_scores = vina_cli.get(receptor_paths=receptor_paths,
 # print(f'Val size: {val_size}')
 
 center_fragments(protected_fragments)
-final_fragments = protected_fragments
 
-# final_fragments = final_fragments[:100]
+torsion_angles_deg = TORSION_ANGLES_DEG
+final_fragments = get_rotated_fragments(protected_fragments, torsion_angles_deg)
 
 valid_action_masks = get_masks(final_fragments)
 
@@ -200,7 +202,7 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_f
                                                     embed_hydrogens=EMBED_HYDROGENS)
                                   for _ in range(n_envs)]
 
-memory_path = '/home/bb596/hdd/ymir/memory_100cplx_100frags.pkl'
+memory_path = '/home/bb596/hdd/ymir/memory_100cplx_100frags_36rots.pkl'
 if os.path.exists(memory_path):
     with open(memory_path, 'rb') as f:
         memory = pickle.load(f)
@@ -248,6 +250,7 @@ def episode(seed_idxs,
             train: bool = True):
     
     # try:
+    fragment_features = agent.extract_fragment_features()
     
     current_seeds = [seeds[seed_i] for seed_i in seed_idxs]
     current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
@@ -290,6 +293,7 @@ def episode(seed_idxs,
         
         current_masks = current_masks.to(device)
         current_action: Action = agent.get_action(features,
+                                                  fragment_features,
                                                     masks=current_masks)
         current_frag_actions = current_action.frag_i.cpu()
         current_frag_logprobs = current_action.frag_logprob.cpu()
@@ -416,7 +420,8 @@ def episode(seed_idxs,
         subset = 'val'
         
     writer.add_scalar(f"{subset}/policy_loss", policy_loss.mean().item(), episode_i)
-    writer.add_scalar(f"{subset}/entropy_loss", entropy_loss.mean().item(), episode_i)
+    # if use_entropy_loss:
+    # writer.add_scalar(f"{subset}/mean_entropy", all_entropies.mean().item(), episode_i)
     writer.add_scalar(f"{subset}/loss", loss.item(), episode_i)
     writer.add_scalar(f"{subset}/fragment_entropy", all_entropies.mean().item(), episode_i)
     writer.add_scalar(f"{subset}/mean_reward", returns[0].mean().item(), episode_i)

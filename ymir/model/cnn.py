@@ -99,7 +99,7 @@ class CNN(torch.nn.Module):
         
         self.node_z_embedder = torch.nn.Embedding(num_embeddings=self.num_elements, 
                                                   embedding_dim=self.node_z_embedding_size)
-        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=2, # seed, pocket or fragment
+        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=3, # seed, pocket or fragment
                                                     embedding_dim=self.node_mol_embedding_size)
         
         self.node_embedding_size = self.node_z_embedding_size + self.node_mol_embedding_size
