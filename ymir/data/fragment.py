@@ -38,7 +38,8 @@ class Fragment():
               
                 
     def protect(self,
-                atom_ids_to_keep: list[int] = []) -> None:
+                atom_ids_to_keep: list[int] = [],
+                protection_atomic_num: int = 1) -> None:
         self.protections: Attachments = {}
         for atom in self.mol.GetAtoms():
             atom_idx: AtomID = atom.GetIdx()
@@ -46,7 +47,7 @@ class Fragment():
                 if atom.GetAtomicNum() == 0:
                     attach_point: AttachPoint = atom.GetIsotope()
                     self.protections[atom_idx] = attach_point
-                    atom.SetAtomicNum(1)
+                    atom.SetAtomicNum(protection_atomic_num)
                     atom.SetIsotope(0)
     
     
@@ -58,6 +59,8 @@ class Fragment():
             atom = self.mol.GetAtomWithIdx(atom_idx)
             atom.SetAtomicNum(0)
             atom.SetIsotope(attach_point)
+            atom.SetNumExplicitHs(0)
+            atom.SetNoImplicit(True)
         self.protections = {}
         
         

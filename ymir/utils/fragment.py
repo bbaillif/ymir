@@ -12,11 +12,15 @@ from ymir.utils.spatial import (rotate_conformer,
 from ymir.molecule_builder import potential_reactions
 from typing import Union, NamedTuple
 from tqdm import tqdm
+from collections import Counter
+from rdkit.Chem.rdFMCS import FindMCS
+from rdkit.Chem.AllChem import AssignBondOrdersFromTemplate
 
 def get_neighbor_id_for_atom_id(mol: Mol,
                                 atom_id: int) -> int:
     atom = mol.GetAtomWithIdx(atom_id)
     neighbors = atom.GetNeighbors()
+    assert len(neighbors) == 1
     neighbor = neighbors[0]
     neighbor_id = neighbor.GetIdx()
     return neighbor_id
@@ -85,9 +89,28 @@ def get_no_attach_mapping(atom_idxs: list[int],
     
     
 def get_fragments_from_mol(mol: Mol) -> list[Fragment]:
+    
+    # fragments = Chem.BRICS.BRICSDecompose(mol,
+    #                                     minFragmentSize=2, 
+    #                                     keepNonLeafNodes=False, 
+    #                                     returnMols=True)
+    
+    # combined_mol = fragments[0]
+    # for fragment in fragments[1:]:
+    #     combined_mol = Chem.CombineMols(combined_mol, fragment)
+    
+    # import pdb;pdb.set_trace()
+    
     pieces = Chem.BRICS.BreakBRICSBonds(mol)
     frags_mol_atom_mapping = []
     frags = Chem.GetMolFrags(pieces, asMols=True, fragsMolAtomMapping=frags_mol_atom_mapping)
+
+    for frag in frags:
+        Chem.AssignStereochemistryFrom3D(frag)
+
+    # for frag in frags:
+    #     if frag.GetNumHeavyAtoms() == 1:
+    #         import pdb;pdb.set_trace()
 
     no_attach_mappings = []
     for mapping in frags_mol_atom_mapping:
@@ -108,22 +131,29 @@ def get_fragments_from_mol(mol: Mol) -> list[Fragment]:
 
 def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
     
-    unique_fragments = []
-    all_smiles = []
+    smiles_fragments = {}
+    smiles_counter = Counter()
     for mol in mols:
         fragments, frags_mol_atom_mapping = get_fragments_from_mol(mol)
         if len(fragments) > 1:
             for i, frag in enumerate(fragments):
                 attach_points = frag.get_attach_points()
+                frag_mol = frag.to_mol()
                 if len(attach_points) > 0:
-                    smiles = Chem.MolToSmiles(frag, 
-                                            allHsExplicit=True)
+                    Chem.SanitizeMol(frag_mol)
+                    smiles = Chem.MolToSmiles(frag_mol, 
+                                            # allHsExplicit=True
+                                            )
                     new_name = mol.GetProp('_Name') + f'_{i}'
-                    frag.SetProp('_Name', 
+                    frag_mol.SetProp('_Name', 
                                 new_name)
-                    if not smiles in all_smiles:
-                        all_smiles.append(smiles)
-                        unique_fragments.append(frag)
+                    # if not smiles in smiles_counter:
+                    smiles_counter.update([smiles])
+                    if not smiles in smiles_fragments:
+                        smiles_fragments[smiles] = frag
+                    
+    ranked_list = smiles_counter.most_common()
+    unique_fragments = [smiles_fragments[smiles] for smiles, _ in ranked_list]
                 
     return unique_fragments
 
@@ -301,7 +331,7 @@ def get_rotated_fragments(protected_fragments,
     for protected_fragment in tqdm(protected_fragments):
         for torsion_value in torsion_angles_deg:
             new_fragment = Fragment.from_fragment(protected_fragment)
-            rotation = Rotation.from_euler('x', torsion_value)
+            rotation = Rotation.from_euler('x', torsion_value, degrees=True)
             rotate_conformer(new_fragment.to_mol().GetConformer(), rotation)
             rotated_fragments.append(new_fragment)
             
@@ -373,3 +403,39 @@ def get_neighbor_symbol(fragment: Fragment):
 #     for i, p in enumerate(centred_pos):
 #         x, y, z = p
 #         conf.SetAtomPosition(i, Point3D(x, y, z))
+
+
+def find_mappings(mcs, mol1, mol2):
+    mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
+    Chem.SanitizeMol(mcs_mol)
+    matches1 = mol1.GetSubstructMatches(mcs_mol, uniquify=False)
+    matches2 = mol2.GetSubstructMatches(mcs_mol, uniquify=False)
+    # import pdb;pdb.set_trace()
+    mappings = []
+    for match1 in matches1:
+        for match2 in matches2:
+            one2mcs = {res: idx for idx, res in enumerate(match1)}
+            mcs2two = {idx: res for idx, res in enumerate(match2)}
+            one2two = {res: mcs2two[idx] for res, idx in one2mcs.items()}
+            mappings.append(one2two)
+    return mappings
+    
+    # assert len(match) == mol1.GetNumHeavyAtoms()
+    # # Try using bond order assignement
+    # standard_mol = AssignBondOrdersFromTemplate(mol1, standard_mol)
+    # mcs = FindMCS([mol1, mol2])
+    # mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
+    # match = standard_mol.GetSubstructMatch(mcs_mol)
+    # if not len(match) == mol1.GetNumAtoms() :
+    #     import pdb;pdb.set_trace()
+    #     raise Exception('No match found between template and actual mol')
+    
+    # self_match = mol1.GetSubstructMatch(mcs_mol)
+    # assert len(match) == len(self_match)
+    # self2mcs = {res: idx for idx, res in enumerate(self_match)}
+    # self2new = {idx: match[res] for idx, res in self2mcs.items()}
+    # new_match = []
+    # for i in range(len(self2new)):
+    #     new_match.append(self2new[i])
+    # mapping = [(mol1i, mol2i) for mol1i, mol2i in enumerate(new_match)]
+    # return mapping

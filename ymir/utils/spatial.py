@@ -1,5 +1,6 @@
 import numpy as np
 
+from rdkit import Chem
 from rdkit.Chem import Conformer, rdMolTransforms
 from scipy.spatial.transform import Rotation
 from typing import Union
@@ -43,3 +44,9 @@ def reverse_transformations(conformer: Conformer,
                             transformations: list[Transformation]):
     for transformation in reversed(transformations):
         apply_transformation(conformer, transformation)
+        
+        
+def rdkit_distance_matrix(mol1: Conformer, mol2: Conformer) -> np.ndarray:
+    combined_mol = Chem.CombineMols(mol1, mol2)
+    distance_matrix = Chem.Get3DDistanceMatrix(combined_mol)
+    return distance_matrix

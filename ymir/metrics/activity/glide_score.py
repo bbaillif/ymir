@@ -143,6 +143,7 @@ class GlideScore():
         
         d = {'GRIDFILE': self.glide_protein.grid_filepath,
              'OUTPUTDIR': self.glide_output_dirpath,
+             'POSE_OUTTYPE': 'ligandlib_sd',
              'DOCKING_METHOD': docking_method,
              'PRECISION' : 'SP',
              'LIGANDFILE': self.ligands_filepath,

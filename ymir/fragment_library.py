@@ -15,6 +15,7 @@ from rdkit.Chem.Descriptors import MolWt
 from ccdc.conformer import ConformerGenerator
 from scipy.spatial.transform import Rotation
 from ymir.utils.spatial import rotate_conformer, translate_conformer
+from ccdc.io import Molecule
 
 
 class FragmentLibrary():
@@ -91,60 +92,90 @@ class FragmentLibrary():
     def select_small_fragments(self,
                                fragments: list[Fragment]) -> list[Fragment]:
         small_fragments = [frag for frag in fragments 
-                            if (frag.GetNumAtoms() <=25) 
-                            and (CalcNumRotatableBonds(frag) <= 3) 
-                            and (MolWt(frag) <= 150)]
+                            if (frag.to_mol().GetNumAtoms() <= 25) 
+                            and (CalcNumRotatableBonds(frag.to_mol()) <= 3) 
+                            and (MolWt(frag.to_mol()) <= 150)]
         return small_fragments
+    
+    
+    def select_single_bond_fragments(self,
+                                     fragments: list[Fragment]) -> list[Fragment]:
+        single_bond_fragments = [frag 
+                                 for frag in fragments 
+                                 if not 7 in list(frag.get_attach_points().values())]
+        return single_bond_fragments
 
 
     def write_fragments(self) -> None:
-        ligands_h = [Chem.AddHs(mol, addCoords=True) for mol in self.ligands]
-        unique_fragments = get_unique_fragments_from_mols(mols=ligands_h)
+        # ligands_h = [Chem.AddHs(mol, addCoords=True) for mol in self.ligands]
+        ligands = self.ligands
+        unique_fragments = get_unique_fragments_from_mols(mols=ligands)
         small_fragments = self.select_small_fragments(fragments=unique_fragments)
+        small_fragments = self.select_single_bond_fragments(fragments=small_fragments)
 
         # import pdb;pdb.set_trace()
 
         cg = ConformerGenerator()
 
-        # small_frags_copy = [Fragment(f) for f in small_fragments]
         small_frags_3D: list[Fragment] = []
         for i, fragment in enumerate(tqdm(small_fragments)):
 
             f = Fragment.from_fragment(fragment)
             if len(f.get_attach_points()) == 0:
                 import pdb;pdb.set_trace()
-            f.protect()
+            f.protect(protection_atomic_num=6)
             protections = f.protections
 
-            ccdc_mol = rdkit_conf_to_ccdc_mol(rdkit_mol=f)
+            mol = Mol(f.to_mol())
+            Chem.SanitizeMol(mol)
+            mol = Chem.AddHs(mol, addCoords=True)
+            
+            # if mol.GetNumAtoms() != f.to_mol().GetNumAtoms() + 3 * len(protections): # 3 hydrogens added
+            #     import pdb;pdb.set_trace()
+            
+            ccdc_mol = rdkit_conf_to_ccdc_mol(rdkit_mol=mol)
             conformer_hits = cg.generate(ccdc_mol)
             for conformer_hit in conformer_hits:
                 conformer = conformer_hit.molecule
+                # ccdc_mol = Molecule.from_string(conformer.to_string())
+                # ccdc_mol.remove_atoms([atom 
+                #                         for atom in ccdc_mol.atoms
+                #                         if atom.atomic_number <= 1])
                 rdkit_mol = ccdc_mol_to_rdkit_mol(conformer)
-                # rdkit_mol = Chem.RemoveHs(rdkit_mol)
+                rdkit_mol = Chem.RemoveHs(rdkit_mol)
                 # we cast to protected fragment to remove the protections next
                 fragment3D = Fragment(rdkit_mol)
                 fragment3D.unprotect(protections=protections)
-                # import pdb;pdb.set_trace()
+                Chem.SanitizeMol(fragment3D.to_mol())
+                
                 small_frags_3D.append(fragment3D)
 
         for frag in small_frags_3D:
             frag.center()
             
         with Chem.SDWriter(self.fragments_path) as writer:
-            for mol in small_frags_3D:
+            for frag in small_frags_3D:
+                mol = frag.to_mol()
                 writer.write(mol)
+        
+        # import pdb;pdb.set_trace()
 
 
     def get_protected_fragments(self) -> list[Fragment]:
         protected_fragments = []
+        smiles_combinations = []
         for fragment in self.fragments:
             attach_points = fragment.get_attach_points()
             if not 7 in list(attach_points.values()): # "7 double bond 7" reaction does not work for some reason...
                 for atom_id, label in attach_points.items():
                     protected_fragment = Fragment.from_fragment(fragment)
                     protected_fragment.protect(atom_ids_to_keep=[atom_id])
-                    protected_fragments.append(protected_fragment)
+                    protected_smiles = Chem.MolToSmiles(protected_fragment.to_mol())
+                    unprotected_smiles = Chem.MolToSmiles(fragment.to_mol())
+                    combo = [protected_smiles, unprotected_smiles]
+                    if not combo in smiles_combinations:
+                        protected_fragments.append(protected_fragment)
+                        smiles_combinations.append(combo)
         
         return protected_fragments
                 
@@ -152,10 +183,10 @@ class FragmentLibrary():
     def get_restricted_fragments(self,
                                  z_list: list[int],
                                  max_attach: int = 10,
-                                 max_torsions: int = 0,
+                                 max_torsions: int = 1,
                                  n_fragments: int = None,
                                  get_unique: bool = False,
-                                 shuffle: bool = True) -> list[Fragment]:
+                                 shuffle: bool = False) -> list[Fragment]:
         
         if shuffle:
             protected_fragments = copy.deepcopy(self.protected_fragments)

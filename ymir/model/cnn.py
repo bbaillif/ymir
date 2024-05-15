@@ -115,7 +115,7 @@ class CNN(torch.nn.Module):
             if i == 0 :
                 irreps_input_node = self.irreps_input_node
             else: # after the first IB, we are in equivariant features
-                irreps_input_node = self.hidden_irreps
+                irreps_input_node = o3.Irreps(f'{NODE_Z_EMBEDDING_SIZE + MOL_ID_EMBEDDING_SIZE}x0e') + self.hidden_irreps
             if i == self.n_interaction_blocks - 1:
                 irreps_output = self.irreps_output
             else:
@@ -174,12 +174,17 @@ class CNN(torch.nn.Module):
 
             edge_sh = self.sh(edge_vec)
             
-            x = interaction_block.forward(x,
+            new_x = interaction_block.forward(x,
                                           edge_sh,
                                           edge_length_embedded,
                                           edge_src,
                                           edge_dst,
                                           avg_num_neighbors)
+            
+            if block_i == 0:
+                x = torch.cat([x, new_x], dim=-1)
+            else:
+                x = new_x
             
         # return x
             

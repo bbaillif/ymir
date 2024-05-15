@@ -121,7 +121,7 @@ IRREPS_OUTPUT = o3.Irreps(f'128x0e')
 N_IRREPS_FRAGMENT = 64
 IRREPS_FRAGMENTS = o3.Irreps(f'{N_IRREPS_FRAGMENT}x0e')
 
-N_ROTATIONS = 36
+N_ROTATIONS = 72
 TORSION_ANGLES_DEG = np.arange(-180, 180, 360 / N_ROTATIONS)
 
 DEFAULT_SF_NAME = 'vina'
@@ -147,9 +147,11 @@ if not os.path.exists(VINA_OUTPUT_DIRECTORY):
 VINA_MAPS_DIRECTORY = '/home/bb596/ymir/vina/maps/'
 if not os.path.exists(VINA_MAPS_DIRECTORY):
     os.mkdir(VINA_MAPS_DIRECTORY)
-VINA_CPUS = 6
+VINA_CPUS = 8
 VINA_SEED = SEED
 VINA_CONFIG_PATH = '/home/bb596/ymir/vina/config.txt'
 VINA_PATH = '/home/bb596/ymir/vina/vina_1.2.5_linux_x86_64'
 
 VINA_DATASET_PATH = '/home/bb596/hdd/ymir/vina_mini_dataset.p'
+
+SCORING_FUNCTION = 'glide'

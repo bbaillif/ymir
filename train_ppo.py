@@ -26,7 +26,8 @@ from ymir.utils.fragment import (get_seeds,
                                  get_rotated_fragments,
                                  get_masks,
                                  select_mol_with_symbols,
-                                 ConstructionSeed)
+                                 ConstructionSeed,
+                                 get_neighbor_id_for_atom_id)
 
 from ymir.atomic_num_table import AtomicNumberTable
 
@@ -40,7 +41,8 @@ from ymir.params import (EMBED_HYDROGENS,
                          VINA_DATASET_PATH,
                          POCKET_RADIUS,
                          NEIGHBOR_RADIUS,
-                         TORSION_ANGLES_DEG)
+                         TORSION_ANGLES_DEG,
+                         SCORING_FUNCTION)
 from ymir.metrics.activity import VinaScore, VinaScorer
 from ymir.metrics.activity.vina_cli import VinaCLI
 from regressor import SOAPFeaturizer, GraphFeaturizer
@@ -49,6 +51,9 @@ from ymir.utils.fragment import get_fragments_from_mol
 from collections import deque
 from torch_cluster import radius_graph
 from ymir.save_state import StateSave, Memory
+from ymir.data.structure import GlideProtein
+from ymir.distribution import CategoricalMasked
+from ymir.molecule_builder import potential_reactions
 
 logging.basicConfig(filename='train_ppo.log', 
                     encoding='utf-8', 
@@ -66,9 +71,9 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 8 # we will have protein envs in parallel
+n_envs = 64 # we will have protein envs in parallel
 batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
-n_steps = 10 # number of maximum fragment growing
+n_max_steps = 5 # number of maximum fragment growing
 # lr = 5e-4
 lr = 2e-4
 gamma = 0.95 # discount factor for rewards
@@ -83,6 +88,9 @@ vf_coef = 0.5
 max_grad_value = 0.5
 
 use_entropy_loss = True
+
+# n_ligands = 200
+n_fragments = 100
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
 experiment_name = f"ymir_v2_ppo_{timestamp}"
@@ -107,32 +115,38 @@ z_table = AtomicNumberTable(zs=z_list)
 
 # Remove ligands having at least one heavy atom not in list
 ligands = fragment_library.get_restricted_ligands(z_list)
-ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
+# ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
 # print([ligand.GetProp('_Name') for ligand in ligands[:50]])
 # ligands = ligands[30:]
-ligands = random.sample(ligands, 1000)
+# ligands = random.sample(ligands, n_ligands)
 
 # Remove fragment having at least one heavy atom not in list
-protected_fragments = fragment_library.get_restricted_fragments(z_list, max_attach=2, n_fragments=100)
-# protected_fragments = protected_fragments[:100]
-
+protected_fragments = fragment_library.get_restricted_fragments(z_list, 
+                                                                max_attach=3, 
+                                                                max_torsions=0,
+                                                                n_fragments=n_fragments)
+# for fragment in protected_fragments:
+#     Chem.SanitizeMol(fragment.to_mol())
+    
+with Chem.SDWriter('protected_fragments.sdf') as sdwriter:
+    for f in protected_fragments:
+        sdwriter.write(f.to_mol())
+# import pdb;pdb.set_trace()
+    
 protected_fragments_smiles = [Chem.MolToSmiles(frag.to_mol()) for frag in protected_fragments]
 
+unprotected_fragments = []
+for fragment in protected_fragments:
+    frag_copy = Fragment.from_fragment(fragment)
+    frag_copy.unprotect()
+    unprotected_fragments.append(frag_copy)
+
+unprotected_fragments_smiles = [Chem.MolToSmiles(frag.to_mol()) for frag in unprotected_fragments]
+
+smiles_combos = [(p_smiles, up_smiles) 
+                 for p_smiles, up_smiles in zip(protected_fragments_smiles, unprotected_fragments_smiles)]
+
 pocket_radius = POCKET_RADIUS
-# input_data_list_path = f'/home/bb596/hdd/ymir/data/input_data_{pocket_radius}.p'
-
-# pre_computed_data = os.path.exists(input_data_list_path)
-# # pre_computed_soap = False
-
-# if pre_computed_data:
-#     with open(input_data_list_path, 'rb') as f:
-#         input_data_list = pickle.load(f)
-# else:
-#     input_data_list = []
-#     graph_featurizer = GraphFeaturizer(z_table=z_table)
-
-# dataset_path = '/home/bb596/hdd/ymir/dataset/'
-# data_filenames = sorted(os.listdir(dataset_path))
 
 lp_pdbbind = pd.read_csv('LP_PDBBind.csv')
 lp_pdbbind = lp_pdbbind.rename({'Unnamed: 0' : 'PDB_ID'}, axis=1)
@@ -143,57 +157,139 @@ for ligand in ligands:
     protein_path, _ = fragment_library.pdbbind.get_pdb_id_pathes(pdb_id)
     protein_paths.append(protein_path)
 
+glide_not_working = ['1px4', '2hjb', '3c2r']
+
 complexes = []
 seeds = []
+generation_sequences = []
 for protein_path, ligand in tqdm(zip(protein_paths, ligands), total=len(protein_paths)):
     fragments, frags_mol_atom_mapping = get_fragments_from_mol(ligand)
+    
     if len(fragments) > 1:
-        ligand_name = ligand.GetProp('_Name')
-        pdb_id = ligand_name.split('_')[0]
-        if pdb_id in lp_pdbbind['PDB_ID'].values:
-            subset = lp_pdbbind[lp_pdbbind['PDB_ID'] == pdb_id]['new_split'].values[0]
-            if subset == 'train':
-                complx = Complex(ligand, protein_path)
-                # break
-                complexes.extend([complx for _ in fragments])
-                seeds.extend(fragments)
+        
+        fragment_in_actions = []
+        for fragment in fragments:
+            frag_copy = Fragment.from_fragment(fragment)
+            up_smiles = Chem.MolToSmiles(frag_copy.to_mol())
+            
+            p_smiles_list = []
+            for attach_point, label in frag_copy.get_attach_points().items():
+                p_frag = Fragment.from_fragment(fragment)
+                p_frag.protect(atom_ids_to_keep=[attach_point])
+                p_smiles = Chem.MolToSmiles(p_frag.to_mol())
+                p_smiles_list.append(p_smiles)
+            
+            up_smiles_ok = up_smiles in unprotected_fragments_smiles
+            p_smiles_ok = all([p_smiles in protected_fragments_smiles for p_smiles in p_smiles_list])
+            
+            # if up_smiles_ok and not p_smiles_ok:
+            #     import pdb;pdb.set_trace()
+            # combo = (p_smiles, up_smiles)
+            fragment_in_actions.append(up_smiles_ok and p_smiles_ok)
+        
+        # take ligands with fragments only in the protected fragments
+        if sum(fragment_in_actions) == len(fragment_in_actions):
+        
+            ligand_name = ligand.GetProp('_Name')
+            pdb_id = ligand_name.split('_')[0]
+            if (pdb_id in lp_pdbbind['PDB_ID'].values) and (not pdb_id in glide_not_working):
+                subset = lp_pdbbind[lp_pdbbind['PDB_ID'] == pdb_id]['new_split'].values[0]
+                if subset == 'train':
+                    complx = Complex(ligand, protein_path)
+                    try:
+                        glide_protein = GlideProtein(pdb_filepath=complx.vina_protein.protein_clean_filepath,
+                                                        native_ligand=complx.ligand)
+                    except KeyboardInterrupt:
+                        import pdb;pdb.set_trace()
+                    except:
+                        logging.info(f'No Glide structure for {pdb_id}')
+                    else:
+                        # complexes.extend([complx for _ in fragments])
+                        
+                        def get_master_frag_i(fragment: Fragment, 
+                                              atom_id_to_keep: int):
+                            frag_copy = Fragment.from_fragment(fragment)
+                            up_smiles = Chem.MolToSmiles(frag_copy.to_mol())
+                            # if up_smiles == '[1*]C([6*])=O':
+                            #     import pdb;pdb.set_trace()
+                            frag_copy.protect([atom_id_to_keep])
+                            p_smiles = Chem.MolToSmiles(frag_copy.to_mol())
+                            combo = (p_smiles, up_smiles)
+                            idxs = [i for i, smiles_combo in enumerate(smiles_combos) if smiles_combo == combo]
+                            assert len(idxs) == 1
+                            try:
+                                master_frag_i = smiles_combos.index(combo)
+                            except Exception as e:
+                                print(str(e))
+                                import pdb;pdb.set_trace()
+                            
+                            return master_frag_i
+                        
+                        def find_broken_bond(ligand, seed, seed_i, fragment, fragment_i, frags_mol_atom_mapping):
+                            try:
+                                for attach_point, label in seed.get_attach_points().items():
+                                    neigh_id1 = get_neighbor_id_for_atom_id(seed.to_mol(), attach_point)
+                                    native_neigh_id1 = frags_mol_atom_mapping[seed_i][neigh_id1]
+                                    for attach_point2, label2 in fragment.get_attach_points().items():
+                                        neigh_id2 = get_neighbor_id_for_atom_id(fragment.to_mol(), attach_point2)
+                                        native_neigh_id2 = frags_mol_atom_mapping[fragment_i][neigh_id2]
+        
+                                        potential_reactions_seed = potential_reactions[label]
+                                        if label2 in potential_reactions_seed:
+                                            bond = ligand.GetBondBetweenAtoms(native_neigh_id1, native_neigh_id2)
+                                            if bond is not None:
+                                                ap1_position = seed.to_mol().GetConformer().GetPositions()[attach_point]
+                                                neigh2_position = fragment.to_mol().GetConformer().GetPositions()[neigh_id2]
+                                                if ap1_position.tolist() == neigh2_position.tolist():
+                                                    return (neigh_id1, attach_point, neigh_id2, attach_point2)
+                            except Exception as e:
+                                print(str(e))
+                                import pdb;pdb.set_trace()
+                            return None
+                        
+                        rg = list(range(len(fragments)))
+                        for initial_frag_i in rg:
+                            placed_fragments_i = [initial_frag_i]
+                            # master_frag_i = get_master_frag_i(current_fragment)
+                            action_sequence = []
+                            
+                            while len(action_sequence) != (len(fragments) - 1):
+                                current_frags_i = list(placed_fragments_i)
+                                for frag_i in current_frags_i:
+                                    current_fragment = fragments[frag_i]
+                                    for other_frag_i in rg:
+                                        other_fragment = fragments[other_frag_i]
+                                        if other_frag_i not in placed_fragments_i:
+                                            broken_bond = find_broken_bond(ligand, current_fragment, frag_i, 
+                                                                           other_fragment, other_frag_i, frags_mol_atom_mapping)
+                                            if broken_bond:
+                                                neigh_id1, attach_point, neigh_id2, attach_point2 = broken_bond
+                                                attach_position = current_fragment.to_mol().GetConformer().GetPositions()[attach_point]
+                                                master_frag_i = get_master_frag_i(other_fragment, atom_id_to_keep=attach_point2)
+                                                # if master_frag_i == 4 and ligand_name == '6t1j_ligand':
+                                                #     import pdb;pdb.set_trace()
+                                                action = (attach_position, master_frag_i)
+                                                action_sequence.append(action)
+                                                placed_fragments_i.append(other_frag_i)
+                            
+                            if ligand_name == '1ajp_ligand':
+                                import pdb;pdb.set_trace()
+                            
+                            seeds.append(fragments[initial_frag_i])
+                            generation_sequences.append(action_sequence)
+                            complexes.append(complx)
 
-# complexes = [complx for _ in fragments]
-# seeds = fragments
+n_complexes = len(complexes)
 
 receptor_paths = [complx.vina_protein.pdbqt_filepath 
                     for complx in complexes]
-native_ligands = [complx.ligand 
-                    for complx in complexes]
-protected_seeds = [Fragment.from_fragment(seed) for seed in seeds]
-# pseeds_h = []
-mols = []
-for pseed in protected_seeds:
-    pseed.protect()
-    mols.append(pseed.to_mol())
-    # pseed = Chem.RemoveHs(pseed)
-    # pseed_h = Chem.AddHs(pseed)
-    # pseeds_h.append(pseed_h)
-    
-vina_cli = VinaCLI()
-initial_scores = vina_cli.get(receptor_paths=receptor_paths,
-                            native_ligands=native_ligands,
-                            ligands=mols)
-        
-# train_seed_idxs = [i for i, subset in enumerate(subsets) if subset == 'train']
-# val_seed_idxs = [i for i, subset in enumerate(subsets) if subset == 'val']
 
-# train_seed_idxs = train_seed_idxs[:100]
-# val_seed_idxs = val_seed_idxs[:100]
-
-# train_size = len(train_seed_idxs)
-# val_size = len(val_seed_idxs)
-# print(f'Train size: {train_size}')
-# print(f'Val size: {val_size}')
+initial_scores = [0 for _ in receptor_paths]
 
 center_fragments(protected_fragments)
 
 torsion_angles_deg = TORSION_ANGLES_DEG
+n_torsions = len(torsion_angles_deg)
 final_fragments = get_rotated_fragments(protected_fragments, torsion_angles_deg)
 
 valid_action_masks = get_masks(final_fragments)
@@ -202,25 +298,29 @@ logging.info(f'There are {len(final_fragments)} fragments')
 
 envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(protected_fragments=final_fragments,
                                                      z_table=z_table,
-                                                    max_episode_steps=n_steps,
+                                                    max_episode_steps=n_max_steps,
                                                     valid_action_masks=valid_action_masks,
                                                     embed_hydrogens=EMBED_HYDROGENS)
                                   for _ in range(n_envs)]
 
-# memory_path = '/home/bb596/hdd/ymir/memory_1000cplx_100frags_36rots.pkl'
-# if os.path.exists(memory_path):
-#     with open(memory_path, 'rb') as f:
-#         memory = pickle.load(f)
-# else:
-#     memory: Memory = {}
-    
-# memory_size = len(memory)
+memory_path = f'/home/bb596/hdd/ymir/memory_{n_complexes}cplx_{n_fragments}frags_36rots_glide_min.pkl'
+if os.path.exists(memory_path):
+    with open(memory_path, 'rb') as f:
+        memory = pickle.load(f)
+else:
+    memory = {}
 
-# memory_save_step = 500
-# memory_i = memory_size // memory_save_step
+# memory = {}
+    
+memory_size = len(memory)
+
+memory_save_step = 500
+memory_i = memory_size // memory_save_step
+
+# memory = {}
 
 batch_env = BatchEnv(envs,
-                    #  memory
+                     memory
                      )
 
 
@@ -235,7 +335,7 @@ batch_env = BatchEnv(envs,
 # val_batch_env = BatchEnv(val_envs,
 #                         memory)
 
-agent = Agent(protected_fragments=final_fragments,
+agent = Agent(protected_fragments=protected_fragments,
               atomic_num_table=z_table,
             #   features_dim=len(all_scores[0])
               )
@@ -292,9 +392,10 @@ def training_loop(agent: Agent,
                 
                 current_masks = mb_masks.to(device)
                 current_frag_actions = mb_frag_actions.to(device)
-                current_action = agent.get_action(features=features,
+                current_policy = agent.get_policy(features=features,
                                                   fragment_features=fragment_features,
-                                                    masks=current_masks,
+                                                    masks=current_masks,)
+                current_action = agent.get_action(current_policy,
                                                     frag_actions=current_frag_actions)
                 
                 current_frag_logprobs = current_action.frag_logprob
@@ -350,7 +451,7 @@ def training_loop(agent: Agent,
     writer.add_scalar("train/entropy", frag_entropy_loss.mean().item(), episode_i)
     writer.add_scalar("train/approx_kl", frag_approx_kl.item(), episode_i)
     writer.add_scalar("train/loss", loss.item(), episode_i)
-    writer.add_scalar("train/mean_return", b_returns.mean(), episode_i)
+    # writer.add_scalar("train/mean_return", b_returns.mean(), episode_i)
     
     return fragment_features
 
@@ -358,7 +459,8 @@ def training_loop(agent: Agent,
 def episode(seed_idxs, 
             fragment_features,
             batch_env: BatchEnv,
-            train: bool = True):
+            train: bool = True,
+            n_real_data: int = n_envs // 4):
     
     # try:
     
@@ -366,23 +468,33 @@ def episode(seed_idxs,
     current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
     current_initial_scores = [initial_scores[seed_i] for seed_i in seed_idxs]
     
+    if n_real_data > 0:
+        real_data_idxs = np.random.choice(range(len(seed_idxs)), n_real_data, replace=False)
+        current_generation_paths = [generation_sequences[seed_i] for seed_i in seed_idxs]
+    else:
+        real_data_idxs = []
+    
     next_info = batch_env.reset(current_complexes,
                                 current_seeds,
                                 current_initial_scores,
-                                seed_idxs)
+                                seed_idxs,
+                                real_data_idxs,
+                                current_generation_paths)
     next_terminated = [False] * n_envs
     
     with torch.no_grad():
-        step_i = 0
         ep_logprobs = []
-        ep_rewards = []
+        # ep_rewards = []
         # ep_entropies = []
         ep_obs = []
         ep_actions = []
         ep_masks = []
         ep_values = []
         ep_terminateds: list[list[bool]] = [] # (n_steps, n_envs)
-        while step_i < n_steps and not all(next_terminated):
+        termination_step = [n_max_steps] * n_envs
+        
+        step_i = 0
+        while step_i < n_max_steps and not all(next_terminated):
             
             current_terminated = next_terminated
             current_obs = batch_env.get_obs()
@@ -409,23 +521,70 @@ def episode(seed_idxs,
                 import pdb;pdb.set_trace()
             
             current_masks = current_masks.to(device)
-            current_action: Action = agent.get_action(features,
-                                                    fragment_features,
-                                                        masks=current_masks)
+            current_policy: CategoricalMasked = agent.get_policy(features,
+                                                                fragment_features,
+                                                                    masks=current_masks)
+            current_action: Action = agent.get_action(current_policy)
             current_frag_actions = current_action.frag_i.cpu()
             current_frag_logprobs = current_action.frag_logprob.cpu()
             
+            try:
+                if n_real_data > 0:
+                    # if step_i == (len(current_generation_paths[0]) - 1):
+                    #     n_ongoing_envs = len(batch_env.ongoing_env_idxs)
+                    #     assert n_ongoing_envs == n_envs
+                    #     master_frag_i = current_generation_paths[0][step_i][1]
+                    #     start = master_frag_i * n_torsions
+                    #     real_frag_is = range(start, 
+                    #                          start + n_ongoing_envs)
+                    #     for i, (env_i, real_frag_i) in enumerate(zip(batch_env.ongoing_env_idxs, real_frag_is)):
+                    #         if env_i in real_data_idxs:
+                    #             env = batch_env.envs[env_i]
+                    #             default_products, default_f2p_mappings = env.initiate_step(frag_action=start, 
+                    #                                                                        sample_rotations=False) # have correct seed translation
+                    #             current_frag_actions[i] = real_frag_i
+                    #             logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
+                    #             current_frag_logprobs[i] = logprob[i]
+                    # else:
+                    for i, env_i in enumerate(batch_env.ongoing_env_idxs):
+                        if env_i in real_data_idxs:
+                            env: FragmentBuilderEnv = batch_env.envs[env_i]
+                            master_frag_i = current_generation_paths[env_i][step_i][1]
+                            real_frag_i = env.find_ground_truth(master_frag_i)
+                            current_frag_actions[i] = real_frag_i
+                            logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
+                            current_frag_logprobs[i] = logprob[i]
+                    
+                    
+                    # for real_data_i in real_data_idxs:
+                    #     if real_data_i in batch_env.ongoing_env_idxs:
+                    #         env: FragmentBuilderEnv = batch_env.envs[real_data_i]
+                    #         master_frag_i = current_generation_paths[real_data_i][step_i][1]
+                    #         real_frag_i = env.find_ground_truth(master_frag_i)
+                    #         current_frag_actions[real_data_i] = real_frag_i
+                    #         logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
+                    #         current_frag_logprobs[real_data_i] = logprob[real_data_i]
+                    
+            except Exception as e:
+                print(str(e))
+                import pdb;pdb.set_trace()
+            
             ep_actions.append(current_frag_actions)
             
-            t = batch_env.step(frag_actions=current_frag_actions)
+            t = batch_env.step(frag_actions=current_frag_actions,
+                               real_data_idxs=real_data_idxs)
             
             logging.info(current_frag_actions)
             logging.info(current_frag_logprobs.exp())
             
-            step_rewards, next_terminated, next_truncated, next_info = t
+            next_terminated, next_truncated = t
+            
+            for env_i, (prev_term, new_term) in enumerate(zip(current_terminated, next_terminated)):
+                if prev_term == False and new_term == True:
+                    termination_step[env_i] = step_i
             
             ep_logprobs.append(current_frag_logprobs)
-            ep_rewards.append(step_rewards)
+            # ep_rewards.append(step_rewards)
             # ep_entropies.append(current_action.frag_entropy)
             ep_terminateds.append(current_terminated)
             
@@ -434,7 +593,26 @@ def episode(seed_idxs,
             
             step_i += 1
             
-        batch_env.save_state()
+        assert all(next_terminated)
+            
+        if SCORING_FUNCTION == 'glide':
+            final_rewards = batch_env.get_rewards_glide(next_truncated, 
+                                                        mininplace=True
+                                                        )
+        else:
+            final_rewards = batch_env.get_rewards(next_truncated)
+        batch_env.save_state(reverse_transformations=True)
+        
+        ep_rewards = []
+        n_steps_in_episode = step_i
+        for step_i in range(n_steps_in_episode):
+            step_rewards = []
+            for env_i in range(n_envs):
+                if step_i < termination_step[env_i]:
+                    step_rewards.append(0)
+                elif step_i == termination_step[env_i]:
+                    step_rewards.append(final_rewards[env_i])
+            ep_rewards.append(step_rewards)
             
         reversed_values = reversed(ep_values)
         reversed_rewards = reversed(ep_rewards)
@@ -505,60 +683,76 @@ def episode(seed_idxs,
                                         b_masks=b_masks,
                                         n_epochs=n_epochs)
   
+    # import pdb;pdb.set_trace()
+  
     writer.add_scalar(f"train/mean_reward", returns[0].mean().item(), episode_i)
     
     return fragment_features
 
         
 fragment_features = agent.extract_fragment_features()
-# try:
 
-for episode_i in tqdm(range(n_episodes)):
-    
-    logging.debug(f'Episode i: {episode_i}')
-    
-    # start_idx = episode_i * n_envs % train_size
-    # end_idx = (episode_i + 1) * n_envs % train_size
-    # if start_idx > end_idx:
-    #     seed_is = list(range(0, end_idx)) + list(range(start_idx, train_size))
-    # else:
-    #     seed_is = list(range(start_idx, end_idx))
-    # train_i = [idx for i, idx in enumerate(train_seed_idxs) if i in seed_is]
-    # logging.info(train_i)
-    
-    train_i = []
-    current_i = 0
-    while len(train_i) < n_envs:
-        train_i.append(current_i)
-        current_i = (current_i + 1) % n_complexes
+n_real_data = n_envs + 1
+
+try:
+
+    for episode_i in tqdm(range(n_episodes)):
         
-    fragment_features = episode(train_i, 
-                                fragment_features,
-                                batch_env)
-    # optimizer.zero_grad()
-    # loss.backward()
-    # optimizer.step()
-    
-    # Save memory every memory_save_step
-    # memory_size = len(memory)
-    # current_memory_i = memory_size // memory_save_step
-    # if (current_memory_i > memory_i):
-    #     with open(memory_path, 'wb') as f:
-    #         pickle.dump(memory, f)
-    #     memory_i = current_memory_i
-    
-    # with torch.no_grad():
-    #     episode(val_seed_idxs, val_batch_env, train=False)
-    
-    # if ((episode_i + 1) % 500 == 0):
-    #     import pdb;pdb.set_trace()
-    
-    if ((episode_i + 1) % 500 == 0):
-        save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt'
-        torch.save(agent.state_dict(), f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt')
+        logging.debug(f'Episode i: {episode_i}')
+        
+        # start_idx = episode_i * n_envs % train_size
+        # end_idx = (episode_i + 1) * n_envs % train_size
+        # if start_idx > end_idx:
+        #     seed_is = list(range(0, end_idx)) + list(range(start_idx, train_size))
+        # else:
+        #     seed_is = list(range(start_idx, end_idx))
+        # train_i = [idx for i, idx in enumerate(train_seed_idxs) if i in seed_is]
+        # logging.info(train_i)
+        
+        # train_i = []
+        # current_i = 0
+        # while len(train_i) < n_envs:
+        #     train_i.append(current_i)
+        #     current_i = (current_i + 1) % n_complexes
+        
+        seed_i = episode_i % n_complexes
+        train_i = [seed_i] * n_envs
             
-# except KeyboardInterrupt:
-#     import pdb;pdb.set_trace()
+        if seed_i == 0 and n_real_data > 1:
+            n_real_data -= 1
+            
+        fragment_features = episode(train_i, 
+                                    fragment_features,
+                                    batch_env,
+                                    # n_real_data=n_real_data
+                                    )
+        # optimizer.zero_grad()
+        # loss.backward()
+        # optimizer.step()
+        
+        # import pdb;pdb.set_trace()
+        
+        # Save memory every memory_save_step
+        memory_size = len(memory)
+        current_memory_i = memory_size // memory_save_step
+        if (current_memory_i > memory_i):
+            with open(memory_path, 'wb') as f:
+                pickle.dump(memory, f)
+            memory_i = current_memory_i
+        logging.info(f'Memory size: {memory_size}')
+        
+        # with torch.no_grad():
+        #     episode(val_seed_idxs, val_batch_env, train=False)
+        
+        # if ((episode_i + 1) % 500 == 0):
+        #     import pdb;pdb.set_trace()
+        
+        if ((episode_i + 1) % 500 == 0):
+            save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt'
+            torch.save(agent.state_dict(), f'/home/bb596/hdd/ymir/models/{experiment_name}_{(episode_i + 1)}.pt')
+            
+except KeyboardInterrupt:
+    import pdb;pdb.set_trace()
         
 # except Exception as e:
 #     print(e)

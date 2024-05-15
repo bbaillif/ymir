@@ -193,6 +193,8 @@ class VinaCLI():
                 pool.join()
         except TimeoutError:
             logging.info('Pool Timeout')
+            
+        logging.info('Vina CLI finished')
         
         assert len(scores) == len(ligands)
         

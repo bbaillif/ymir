@@ -8,7 +8,8 @@ from typing import NamedTuple
 from ymir.params import (EMBED_HYDROGENS, 
                          L_MAX, 
                          HIDDEN_IRREPS,
-                         IRREPS_OUTPUT)
+                         IRREPS_OUTPUT,
+                         TORSION_ANGLES_DEG)
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
 from torch_geometric.data import Batch
@@ -92,6 +93,7 @@ class Agent(nn.Module):
                 #  lmax: int = L_MAX,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
+                 torsion_angle_deg: list[float] = TORSION_ANGLES_DEG,
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
@@ -102,6 +104,7 @@ class Agent(nn.Module):
         # self.lmax = lmax
         self.device = device
         self.embed_hydrogens = embed_hydrogens
+        self.torsion_angles_deg = torsion_angle_deg
         
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
@@ -125,22 +128,27 @@ class Agent(nn.Module):
         self.fragment_batch = Batch.from_data_list(data_list)
         self.fragment_batch = self.fragment_batch.to(self.device)
         
-        self.pocket_irreps = o3.Irreps(f'1x0e + 16x1o + 16x2e')
-        self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'32x1o + 32x2e'),
+        self.pocket_irreps = o3.Irreps(f'1x0e + 8x1o + 8x2e')
+        self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'16x1o + 16x2e'),
                                             irreps_output=self.pocket_irreps,
                                              num_elements=len(self.z_table))
         
-        fragment_irreps = o3.Irreps(f'8x1o + 8x2e')
-        self.fragment_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'16x1o + 16x2e'),
-                                              irreps_output=fragment_irreps,
+        self.fragment_irreps = o3.Irreps(f'4x1o + 4x2e')
+        self.fragment_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'8x1o + 8x2e'),
+                                              irreps_output=self.fragment_irreps,
                                               num_elements=len(self.z_table))
         
         actor_irreps = o3.Irreps(f'1x0e')
         self.actor_tp = o3.FullyConnectedTensorProduct(irreps_in1=self.pocket_irreps[1:], 
-                                                            irreps_in2=fragment_irreps, 
+                                                            irreps_in2=self.fragment_irreps, 
                                                             irreps_out=actor_irreps, 
                                                             internal_weights=True)
         self.actor_tp.to(self.device)
+        
+        self.torsion_angles_rad = torch.deg2rad(torch.tensor(self.torsion_angles_deg))
+        self.rot_mats = o3.matrix_x(self.torsion_angles_rad)
+        self.d_hidden_irreps = self.fragment_irreps.D_from_matrix(self.rot_mats) # (n_angles, irreps_dim, irreps_dim)
+        self.d_hidden_irreps = self.d_hidden_irreps.float().to(self.device)
 
 
     def forward(self, 
@@ -163,14 +171,29 @@ class Agent(nn.Module):
     
     def extract_fragment_features(self):
         features = self.fragment_feature_extractor(self.fragment_batch)
-        return features
+        
+        fragment_features = torch.einsum('bi,rji->brj', features, self.d_hidden_irreps)
+        fragment_features = fragment_features.reshape(-1, self.fragment_irreps.dim)
+        
+        # apply rotation
+        # n_frags = len(features)
+        # n_rotations = len(self.torsion_angles_rad)
+        # frag_indices = torch.arange(n_frags)
+        # frag_indices = torch.repeat_interleave(frag_indices, n_rotations)
+        # frag_features = features[frag_indices] # (n_pocket*n_rotations*n_fragments, irreps_dim)
+        
+        # rotation_indices = torch.arange(n_rotations)
+        # rotation_indices = rotation_indices.repeat(n_frags)
+        # rotations = self.d_hidden_irreps[rotation_indices]
+        
+        return fragment_features
     
 
-    def get_action(self, 
+    def get_policy(self, 
                    features: torch.Tensor, # (n_nodes, irreps_pocket_features)
                    fragment_features: torch.Tensor,
                    masks: torch.Tensor = None, # (n_pockets, n_fragments)
-                   frag_actions: torch.Tensor = None # (action_dim),
+                #    frag_actions: torch.Tensor = None # (action_dim),
                    ) -> Action:
             
         inv_features, equi_features = self.split_features(features, self.pocket_irreps)
@@ -203,6 +226,9 @@ class Agent(nn.Module):
             import pdb;pdb.set_trace()
         frag_categorical = CategoricalMasked(logits=frag_logits,
                                             masks=masks)
+        
+        return frag_categorical
+        
         if frag_actions is None:
             frag_actions = frag_categorical.sample()
         frag_logprob = frag_categorical.log_prob(frag_actions)
@@ -213,7 +239,24 @@ class Agent(nn.Module):
                         frag_entropy=frag_entropy)
         
         return action
-
+    
+    
+    def get_action(self,
+                   frag_categorical: CategoricalMasked,
+                   frag_actions: torch.Tensor = None,
+                   ) -> Action:
+        
+        if frag_actions is None:
+            frag_actions = frag_categorical.sample()
+        frag_logprob = frag_categorical.log_prob(frag_actions)
+        frag_entropy = frag_categorical.entropy()
+        
+        action = Action(frag_i=frag_actions,
+                        frag_logprob=frag_logprob,
+                        frag_entropy=frag_entropy)
+        
+        return action
+    
 
     def get_value(self, 
                   features: torch.Tensor,

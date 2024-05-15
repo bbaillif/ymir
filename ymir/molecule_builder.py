@@ -170,7 +170,7 @@ def add_fragment_to_seed(seed: Fragment,
     product = Fragment(mol=product, protections=product_protections)
     product.unprotect()
     
-    return product
+    return product, seed_to_product_mapping, fragment_to_product_mapping
     
     
 def get_product_protections(seed_protections,
