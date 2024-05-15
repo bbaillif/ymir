@@ -99,7 +99,7 @@ class CNN(torch.nn.Module):
         
         self.node_z_embedder = torch.nn.Embedding(num_embeddings=self.num_elements, 
                                                   embedding_dim=self.node_z_embedding_size)
-        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=3, # seed, pocket or fragment
+        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=2, # seed, pocket or fragment
                                                     embedding_dim=self.node_mol_embedding_size)
         
         self.node_embedding_size = self.node_z_embedding_size + self.node_mol_embedding_size
@@ -115,7 +115,7 @@ class CNN(torch.nn.Module):
             if i == 0 :
                 irreps_input_node = self.irreps_input_node
             else: # after the first IB, we are in equivariant features
-                irreps_input_node = o3.Irreps(f'{NODE_Z_EMBEDDING_SIZE + MOL_ID_EMBEDDING_SIZE}x0e') + self.hidden_irreps
+                irreps_input_node = self.hidden_irreps
             if i == self.n_interaction_blocks - 1:
                 irreps_output = self.irreps_output
             else:
@@ -143,10 +143,7 @@ class CNN(torch.nn.Module):
         
         for block_i, interaction_block in enumerate(self.interaction_blocks):
             
-            if block_i == 0:
-                radius = NEIGHBOR_RADIUS
-            else:
-                radius = self.max_radius
+            radius = self.max_radius
             
             edge_src, edge_dst = radius_graph(pos, 
                                           radius,
@@ -181,48 +178,14 @@ class CNN(torch.nn.Module):
                                           edge_dst,
                                           avg_num_neighbors)
             
-            if block_i == 0:
-                x = torch.cat([x, new_x], dim=-1)
-            else:
-                x = new_x
+            x = new_x
             
         # return x
             
-        # output = scatter(x,
-        #                  batch.batch,
-        #                  dim=0,
-        #                  reduce='mean')
-        
-        output = x[batch.is_focal]
-        # assert output.shape[0] == batch.batch.max() + 1
-        
-        # rot = o3.rand_matrix().to(pos)
-        # pos_r = batch.pos @ rot.T
-
-        # edge_vec_r = pos_r
-        # edge_length_r = edge_vec_r.norm(dim=1)
-
-        # edge_length_embedded_r = soft_one_hot_linspace(
-        #     x=edge_length_r,
-        #     start=0.0,
-        #     end=self.max_radius,
-        #     number=self.number_of_basis,
-        #     basis='smooth_finite',
-        #     cutoff=True
-        # )
-        # edge_length_embedded_r = edge_length_embedded_r.mul(self.number_of_basis**0.5)
-
-        # edge_sh_r = self.sh(edge_vec_r)
-        
-        # value_weights_r = self.value_weights_fc(edge_length_embedded_r)
-        # value_r = self.tp_value(x=x, 
-        #                       y=edge_sh_r, 
-        #                       weight=value_weights_r)
-
-        # output_r = scatter(src=value_r,
-        #                  index=batch.batch, 
-        #                  dim=0,
-        #                  reduce='mean')
+        output = scatter(x,
+                         batch.batch,
+                         dim=0,
+                         reduce='mean')
 
         return output
     

@@ -10,7 +10,7 @@ from ase.io import read
 from ymir.molecule_builder import add_fragment_to_seed
 from ymir.utils.fragment import get_fragments_from_mol, get_neighbor_symbol, center_fragment, find_mappings
 from ymir.data.structure.complex import Complex
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from ymir.data import Fragment
 from typing import Any
 from scipy.spatial.transform import Rotation
@@ -294,22 +294,8 @@ class FragmentBuilderEnv():
         return ase_atoms
         
     
-    def featurize_pocket(self) -> Data:
+    def featurize_actions(self) -> Batch:
         center_pos = [0, 0, 0]
-        # seed_copy = Fragment(self.seed, self.seed.protections)
-        # seed_copy.protect()
-        # seed_atoms = self.rdkit_to_ase(seed_copy)
-        # pocket_atoms = self.rdkit_to_ase(self.pocket_mol)
-        # if not self.embed_hydrogens:
-        #     seed_atoms = seed_atoms[[atom.index for atom in seed_atoms if atom.symbol != 'H']]
-        #     pocket_atoms = pocket_atoms[[atom.index for atom in pocket_atoms if atom.symbol != 'H']]
-        
-        # total_atoms = seed_atoms + pocket_atoms
-        # seed_soap = self.soap.create(total_atoms, centers=[center_pos])
-
-        # seed_soap = normalize(seed_soap)
-
-        # return seed_soap.squeeze()
         
         ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
                                                                     embed_hydrogens=self.embed_hydrogens,
@@ -320,23 +306,59 @@ class FragmentBuilderEnv():
         
         pocket_x = protein_x + ligand_x
         pocket_pos = protein_pos + ligand_pos
-        is_focal = protein_focal + ligand_focal
         
+        data_list = []
+        for fragment in self.protected_fragments:
+            fragment_x, fragment_pos, fragment_focal = \
+                self.featurizer.get_fragment_features(fragment=fragment, 
+                                                    embed_hydrogens=self.embed_hydrogens,
+                                                    center_pos=center_pos)
+            pf_x = pocket_x + fragment_x
+            pf_pos = pocket_pos + fragment_pos
+            
+            mol_id = [0] * len(protein_x) + [1] * len(ligand_x) + [1] * len(fragment_x)
+            
+            x = torch.tensor(pf_x, dtype=torch.long)
+            pos = torch.tensor(pf_pos, dtype=torch.float)
+            mol_id = torch.tensor(mol_id, dtype=torch.long)
+        
+            data = Data(x=x,
+                        pos=pos,
+                        mol_id=mol_id
+                        )
+            data_list.append(data)
+
+        batch = Batch.from_data_list(data_list)
+
+        return batch
+    
+    
+    def featurize_pocket(self) -> Data:
+        center_pos = [0, 0, 0]
+        
+        ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
+                                                                    embed_hydrogens=self.embed_hydrogens,
+                                                                    center_pos=center_pos)
+        protein_x, protein_pos, protein_focal = self.featurizer.get_mol_features(mol=self.pocket_mol,
+                                                                embed_hydrogens=self.embed_hydrogens,
+                                                                center_pos=center_pos)
+        
+        pocket_x = protein_x + ligand_x
+        pocket_pos = protein_pos + ligand_pos
         mol_id = [0] * len(protein_x) + [1] * len(ligand_x)
         
-        # x = torch.tensor(pocket_x, dtype=torch.float)
         x = torch.tensor(pocket_x, dtype=torch.long)
         pos = torch.tensor(pocket_pos, dtype=torch.float)
         mol_id = torch.tensor(mol_id, dtype=torch.long)
-        is_focal = torch.tensor(is_focal, dtype=torch.bool)
         
         data = Data(x=x,
                     pos=pos,
-                    mol_id=mol_id,
-                    is_focal=is_focal,
+                    mol_id=mol_id
                     )
+        data_list = [data]
+        batch = Batch.from_data_list(data_list)
 
-        return data
+        return batch
     
     
     def set_focal_atom_id(self) -> bool:
@@ -1033,7 +1055,21 @@ class BatchEnv():
         return mols
             
             
-    def get_obs(self,
+    def get_action_obs(self,
+                all_envs: bool = False) -> list[Data]:
+        obs_list = []
+        if all_envs:
+            env_idxs = range(len(self.envs))
+        else: # take ongoing
+            env_idxs = self.ongoing_env_idxs
+        for env_i in env_idxs:
+            env = self.envs[env_i]
+            obs = env.featurize_actions()
+            obs_list.append(obs)
+        return obs_list
+    
+    
+    def get_pocket_obs(self,
                 all_envs: bool = False) -> list[Data]:
         obs_list = []
         if all_envs:

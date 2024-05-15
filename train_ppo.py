@@ -71,7 +71,7 @@ torch.backends.cudnn.deterministic = True
 
 # 1 episode = grow fragments + update NN
 n_episodes = 100_000
-n_envs = 64 # we will have protein envs in parallel
+n_envs = 1 # we will have protein envs in parallel
 batch_size = min(n_envs, 16) # NN batch, input is Data, output are actions + predicted reward
 n_max_steps = 5 # number of maximum fragment growing
 # lr = 5e-4
@@ -352,8 +352,8 @@ n_complexes = len(complexes)
 logging.info(f'Training on {n_complexes} complexes')
 
 def training_loop(agent: Agent,
-                  fragment_features,
-                  b_obs: list[Data],
+                  b_action_obs: list[Data],
+                  b_pocket_obs: list[Data],
                     b_frag_actions,
                     b_frag_logprobs,
                     b_advantages,
@@ -362,7 +362,7 @@ def training_loop(agent: Agent,
                     b_masks,
                     n_epochs=5,
                     ):
-    n_obs = len(b_obs)
+    n_obs = len(b_action_obs)
     logging.info(f'{n_obs} obs for epochs')
     
     inds = np.arange(n_obs)
@@ -381,19 +381,24 @@ def training_loop(agent: Agent,
                 
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
                 
-                mb_obs = [b_obs[i] for i in minibatch_inds]
+                mb_action_obs = [b_action_obs[i] for i in minibatch_inds]
+                mb_pocket_obs = [b_pocket_obs[i] for i in minibatch_inds]
                 mb_frag_actions = b_frag_actions[minibatch_inds]
                 mb_masks = b_masks[minibatch_inds]
                 
-                batch = Batch.from_data_list(mb_obs)
+                # batch = Batch.from_data_list(mb_action_obs)
+                batch = mb_action_obs[0]
                 batch = batch.to(device)
                 
+                pocket_batch = mb_pocket_obs[0]
+                pocket_batch = pocket_batch.to(device)
+                
                 features = agent.extract_features(batch)
+                pocket_features = agent.extract_features(pocket_batch)
                 
                 current_masks = mb_masks.to(device)
                 current_frag_actions = mb_frag_actions.to(device)
                 current_policy = agent.get_policy(features=features,
-                                                  fragment_features=fragment_features,
                                                     masks=current_masks,)
                 current_action = agent.get_action(current_policy,
                                                     frag_actions=current_frag_actions)
@@ -418,7 +423,7 @@ def training_loop(agent: Agent,
                 mb_values = b_values[minibatch_inds]
                 mb_returns = mb_returns.to(device)
                 mb_values = mb_values.to(device)
-                current_values = agent.get_value(features=features)
+                current_values = agent.get_value(features=pocket_features)
                 v_loss_unclipped = ((current_values - mb_returns) ** 2)
                 v_clipped = mb_values + torch.clamp(current_values - mb_values, 
                                                     -clip_coef, 
@@ -443,24 +448,18 @@ def training_loop(agent: Agent,
                                         clip_value=max_grad_value)
                 optimizer.step()
                 
-                # Reload fragment_features
-                fragment_features = agent.extract_fragment_features()
-                
     writer.add_scalar("train/value_loss", v_loss.item(), episode_i)
     writer.add_scalar("train/policy_loss", frag_pg_loss.item(), episode_i)
     writer.add_scalar("train/entropy", frag_entropy_loss.mean().item(), episode_i)
     writer.add_scalar("train/approx_kl", frag_approx_kl.item(), episode_i)
     writer.add_scalar("train/loss", loss.item(), episode_i)
     # writer.add_scalar("train/mean_return", b_returns.mean(), episode_i)
-    
-    return fragment_features
 
 
 def episode(seed_idxs, 
-            fragment_features,
             batch_env: BatchEnv,
             train: bool = True,
-            n_real_data: int = n_envs // 4):
+            n_real_data: int = 0):
     
     # try:
     
@@ -470,9 +469,10 @@ def episode(seed_idxs,
     
     if n_real_data > 0:
         real_data_idxs = np.random.choice(range(len(seed_idxs)), n_real_data, replace=False)
-        current_generation_paths = [generation_sequences[seed_i] for seed_i in seed_idxs]
     else:
         real_data_idxs = []
+        
+    current_generation_paths = [generation_sequences[seed_i] for seed_i in seed_idxs]
     
     next_info = batch_env.reset(current_complexes,
                                 current_seeds,
@@ -486,7 +486,8 @@ def episode(seed_idxs,
         ep_logprobs = []
         # ep_rewards = []
         # ep_entropies = []
-        ep_obs = []
+        ep_action_obs = []
+        ep_pocket_obs = []
         ep_actions = []
         ep_masks = []
         ep_values = []
@@ -497,77 +498,33 @@ def episode(seed_idxs,
         while step_i < n_max_steps and not all(next_terminated):
             
             current_terminated = next_terminated
-            current_obs = batch_env.get_obs()
-            ep_obs.append(current_obs)
+            current_obs = batch_env.get_action_obs()
+            ep_action_obs.append(current_obs)
+            
+            current_pocket = batch_env.get_pocket_obs()
+            ep_pocket_obs.append(current_pocket)
             
             current_masks = batch_env.get_valid_action_mask()
             ep_masks.append(current_masks)
             
-            batch = Batch.from_data_list(current_obs)
-            batch = batch.to(device)
+            action_batch = current_obs[0]
+            action_batch = action_batch.to(device)
             
-            # radius = NEIGHBOR_RADIUS
-            # edge_src, edge_dst = radius_graph(batch.pos, 
-            #                                   radius,
-            #                                   batch=batch.batch)
-            # if edge_src.unique().size()[0] != (batch.x.size()[0]):
-            #     import pdb;pdb.set_trace()
-            # if edge_dst.unique().size()[0] != (batch.x.size()[0]):
-            #     import pdb;pdb.set_trace()
+            pocket_batch = current_pocket[0]
+            pocket_batch = pocket_batch.to(device)
             
-            features = agent.extract_features(batch)
+            action_features = agent.extract_features(action_batch)
+            pocket_features = agent.extract_features(pocket_batch)
             
-            if current_masks.size()[0] != features.size()[0] :
+            if current_masks.size()[0] != action_features.size()[0] :
                 import pdb;pdb.set_trace()
             
             current_masks = current_masks.to(device)
-            current_policy: CategoricalMasked = agent.get_policy(features,
-                                                                fragment_features,
+            current_policy: CategoricalMasked = agent.get_policy(action_features,
                                                                     masks=current_masks)
             current_action: Action = agent.get_action(current_policy)
             current_frag_actions = current_action.frag_i.cpu()
             current_frag_logprobs = current_action.frag_logprob.cpu()
-            
-            try:
-                if n_real_data > 0:
-                    # if step_i == (len(current_generation_paths[0]) - 1):
-                    #     n_ongoing_envs = len(batch_env.ongoing_env_idxs)
-                    #     assert n_ongoing_envs == n_envs
-                    #     master_frag_i = current_generation_paths[0][step_i][1]
-                    #     start = master_frag_i * n_torsions
-                    #     real_frag_is = range(start, 
-                    #                          start + n_ongoing_envs)
-                    #     for i, (env_i, real_frag_i) in enumerate(zip(batch_env.ongoing_env_idxs, real_frag_is)):
-                    #         if env_i in real_data_idxs:
-                    #             env = batch_env.envs[env_i]
-                    #             default_products, default_f2p_mappings = env.initiate_step(frag_action=start, 
-                    #                                                                        sample_rotations=False) # have correct seed translation
-                    #             current_frag_actions[i] = real_frag_i
-                    #             logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
-                    #             current_frag_logprobs[i] = logprob[i]
-                    # else:
-                    for i, env_i in enumerate(batch_env.ongoing_env_idxs):
-                        if env_i in real_data_idxs:
-                            env: FragmentBuilderEnv = batch_env.envs[env_i]
-                            master_frag_i = current_generation_paths[env_i][step_i][1]
-                            real_frag_i = env.find_ground_truth(master_frag_i)
-                            current_frag_actions[i] = real_frag_i
-                            logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
-                            current_frag_logprobs[i] = logprob[i]
-                    
-                    
-                    # for real_data_i in real_data_idxs:
-                    #     if real_data_i in batch_env.ongoing_env_idxs:
-                    #         env: FragmentBuilderEnv = batch_env.envs[real_data_i]
-                    #         master_frag_i = current_generation_paths[real_data_i][step_i][1]
-                    #         real_frag_i = env.find_ground_truth(master_frag_i)
-                    #         current_frag_actions[real_data_i] = real_frag_i
-                    #         logprob = current_policy.log_prob(torch.tensor([real_frag_i]).to(features))
-                    #         current_frag_logprobs[real_data_i] = logprob[real_data_i]
-                    
-            except Exception as e:
-                print(str(e))
-                import pdb;pdb.set_trace()
             
             ep_actions.append(current_frag_actions)
             
@@ -588,10 +545,12 @@ def episode(seed_idxs,
             # ep_entropies.append(current_action.frag_entropy)
             ep_terminateds.append(current_terminated)
             
-            current_values = agent.get_value(features)
+            current_values = agent.get_value(pocket_features)
             ep_values.append(current_values.cpu())
             
             step_i += 1
+            
+            import pdb;pdb.set_trace()
             
         assert all(next_terminated)
             
@@ -657,10 +616,15 @@ def episode(seed_idxs,
         returns = list(reversed(reversed_returns))
         advantages = list(reversed(reversed_advantages))
         
-        b_obs: list[Data] = []
-        for data_list in ep_obs:
+        b_action_obs: list[Data] = []
+        for data_list in ep_action_obs:
             for data in data_list:
-                b_obs.append(data)
+                b_action_obs.append(data)
+                
+        b_pocket_obs: list[Data] = []
+        for data_list in ep_pocket_obs:
+            for data in data_list:
+                b_pocket_obs.append(data)
         
         b_frag_actions = torch.cat(ep_actions)
         b_frag_logprobs = torch.cat(ep_logprobs)
@@ -672,25 +636,20 @@ def episode(seed_idxs,
         
         logging.info(b_returns)
     
-    fragment_features = training_loop(agent=agent,
-                                    fragment_features=fragment_features,
-                                        b_obs=b_obs,
-                                        b_frag_actions=b_frag_actions,
-                                        b_frag_logprobs=b_frag_logprobs,
-                                        b_advantages=b_advantages,
-                                        b_returns=b_returns,
-                                        b_values=b_values,
-                                        b_masks=b_masks,
-                                        n_epochs=n_epochs)
+    training_loop(agent=agent,
+                b_action_obs=b_action_obs,
+                b_pocket_obs=b_pocket_obs,
+                b_frag_actions=b_frag_actions,
+                b_frag_logprobs=b_frag_logprobs,
+                b_advantages=b_advantages,
+                b_returns=b_returns,
+                b_values=b_values,
+                b_masks=b_masks,
+                n_epochs=n_epochs)
   
     # import pdb;pdb.set_trace()
   
     writer.add_scalar(f"train/mean_reward", returns[0].mean().item(), episode_i)
-    
-    return fragment_features
-
-        
-fragment_features = agent.extract_fragment_features()
 
 n_real_data = n_envs + 1
 
@@ -721,11 +680,10 @@ try:
         if seed_i == 0 and n_real_data > 1:
             n_real_data -= 1
             
-        fragment_features = episode(train_i, 
-                                    fragment_features,
-                                    batch_env,
-                                    # n_real_data=n_real_data
-                                    )
+        episode(train_i,
+                batch_env,
+                # n_real_data=n_real_data
+                )
         # optimizer.zero_grad()
         # loss.backward()
         # optimizer.step()
