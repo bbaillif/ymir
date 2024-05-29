@@ -9,11 +9,12 @@ from ymir.params import (EMBED_HYDROGENS,
                          L_MAX, 
                          HIDDEN_IRREPS,
                          IRREPS_OUTPUT,
-                         TORSION_ANGLES_DEG)
+                         TORSION_ANGLES_DEG,
+                         COMENET_CONFIG)
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
 from torch_geometric.data import Batch
-from ymir.model import CNN
+from ymir.model import CNN, ComENetModel
 from torch_scatter import scatter
 from ymir.featurizer_sn import Featurizer
 from torch_geometric.data import Data
@@ -87,35 +88,55 @@ class Agent(nn.Module):
     def __init__(self, 
                  protected_fragments: list[Fragment],
                  atomic_num_table: AtomicNumberTable,
-                #  features_dim: int,
+                 features_dim: int,
                  hidden_irreps: o3.Irreps = HIDDEN_IRREPS,
                  irreps_output: o3.Irreps = IRREPS_OUTPUT,
                 #  lmax: int = L_MAX,
                  device: torch.device = torch.device('cuda'),
                  embed_hydrogens: bool = EMBED_HYDROGENS,
                  torsion_angle_deg: list[float] = TORSION_ANGLES_DEG,
+                 pocket_feature_type: str = 'soap',
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
         self.z_table = atomic_num_table
-        # self.features_dim = features_dim
+        self.features_dim = features_dim
         self.hidden_irreps = hidden_irreps
         self.irreps_output = irreps_output
         # self.lmax = lmax
         self.device = device
         self.embed_hydrogens = embed_hydrogens
         self.torsion_angles_deg = torsion_angle_deg
+        self.pocket_feature_type = pocket_feature_type
         
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
         
-        self.pocket_irreps = o3.Irreps(f'128x0e')
-        self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'16x0e + 16x1o + 16x2e'),
-                                            irreps_output=self.pocket_irreps,
-                                             num_elements=len(self.z_table))
+        # self.pocket_irreps = o3.Irreps(f'128x0e')
+        # n_hidden_features = self.pocket_irreps.dim
+        n_hidden_features = 128
+        # self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'16x0e + 16x1o + 16x2e'),
+        #                                     irreps_output=self.pocket_irreps,
+        #                                      num_elements=len(self.z_table))
         
-        self.actor = nn.Linear(self.pocket_irreps.dim, 1)
-        self.critic = nn.Linear(self.pocket_irreps.dim, 1)
+        if self.pocket_feature_type == 'soap':
+            self.pocket_feature_extractor = MultiLinear(self.features_dim, 
+                                                        [self.features_dim, self.features_dim // 2], 
+                                                        n_hidden_features)
+        else:
+            # self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
+            #                                             features_dim=n_hidden_features)
+            self.pocket_irreps = o3.Irreps(f'{n_hidden_features}x0e')
+            self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'64x0e + 16x1o + 16x2e'),
+                                                irreps_output=self.pocket_irreps,
+                                                num_elements=len(self.z_table))
+        
+        # self.pocket_feature_extractor = MultiLinear(self.features_dim, [256, 128], n_hidden_features)
+        
+        self.actor = nn.Linear(n_hidden_features, self.n_fragments)
+        # self.critic = nn.Linear(n_hidden_features, 1)
+        # self.actor = MultiLinear(n_hidden_features, [128, 64], self.n_fragments)
+        # self.critic = MultiLinear(n_hidden_features, [128, 64], 1)
 
 
     def forward(self, 
@@ -129,19 +150,37 @@ class Agent(nn.Module):
     
     def extract_features(self,
                          x: Batch):
-        # noise = torch.randn_like(x.pos) / 50 # variance of 0.1
-        # noise = noise.to(x.pos)
-        # x.pos = x.pos + noise
-        features = self.pocket_feature_extractor(x)
+        if self.pocket_feature_type == 'soap':
+            features = self.pocket_feature_extractor(x)
+        else:
+            # features = self.pocket_feature_extractor(x)
+            features = self.pocket_feature_extractor.get_atomic_contributions(x)
         return features
     
 
     def get_policy(self, 
                    features: torch.Tensor, # (n_nodes, irreps_pocket_features)
+                   batch: torch.Tensor,
                    masks: torch.Tensor = None, # (n_pockets, n_fragments)
                    ) -> Action:
             
-        logits = self.actor(features)
+        atom_logits = self.actor(features)
+        
+        if self.pocket_feature_type == 'graph':
+            try:
+                logits = scatter(atom_logits,
+                                batch,
+                                dim=0,
+                                reduce='mean')
+            except:
+                import pdb;pdb.set_trace()
+        else:
+            logits = atom_logits
+        
+        # logits = torch.clamp(logits, -1, 1)
+        # logits = torch.tanh(logits)
+        
+        # logits = self.actor(features)
         logits = logits.squeeze(-1)
         
         # Fragment sampling
@@ -173,7 +212,16 @@ class Agent(nn.Module):
 
     def get_value(self, 
                   features: torch.Tensor,
+                  batch: torch.Tensor,
                   ) -> torch.Tensor:
-        value = self.critic(features)
+        atom_values = self.critic(features)
+        
+        value = scatter(atom_values,
+                        batch,
+                        dim=0,
+                        reduce='mean')
+        
+        # value = self.critic(features)
+        
         return value
     

@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import euclidean
 from ymir.utils.spatial import (rotate_conformer, 
                                 translate_conformer)
-from ymir.molecule_builder import potential_reactions
+from ymir.molecule_builder import potential_reactions, add_fragment_to_seed
 from typing import Union, NamedTuple
 from tqdm import tqdm
 from collections import Counter
@@ -83,10 +83,109 @@ def get_max_num_neighbor_from_original(atom_id: int,
     
     
 def get_no_attach_mapping(atom_idxs: list[int],
-                          mol: Mol):
-    n_atoms = mol.GetNumAtoms()
-    return [i for i in atom_idxs if i < n_atoms]
+                          fragment: Fragment):
+    attach_points = fragment.get_attach_points(include_protected=True).keys()
+    new_mapping = [atom_idx 
+                   for i, atom_idx in enumerate(atom_idxs) 
+                   if i not in attach_points]
+    return new_mapping
     
+    
+# def find_broken_bond(ligand: Mol, 
+#                      seed: Fragment, 
+#                      seed_i: int, 
+#                      fragment: Fragment, 
+#                      fragment_i: int, 
+#                      frags_mol_atom_mapping: list[list[int]]):
+#     try:
+#         # if Chem.MolToSmiles(seed.mol) == '[3*]O[3*]' and Chem.MolToSmiles(fragment.mol) == '[1*]C([1*])=O':
+#         #     import pdb;pdb.set_trace()
+#         for attach_point, label in seed.get_attach_points().items():
+#             neigh_id1 = get_neighbor_id_for_atom_id(seed.mol, attach_point)
+#             mapping1 = frags_mol_atom_mapping[seed_i]
+#             native_neigh_id1 = mapping1[neigh_id1]
+#             # native_ap1 = mapping1[attach_point]
+#             for attach_point2, label2 in fragment.get_attach_points().items():
+#                 neigh_id2 = get_neighbor_id_for_atom_id(fragment.mol, attach_point2)
+#                 mapping2 = frags_mol_atom_mapping[fragment_i]
+#                 native_neigh_id2 = mapping2[neigh_id2]
+#                 # native_ap2 = mapping2[attach_point2]
+
+#                 potential_reactions_seed = potential_reactions[label]
+#                 if label2 in potential_reactions_seed:
+#                     bond = ligand.GetBondBetweenAtoms(native_neigh_id1, native_neigh_id2)
+#                     if bond is not None:
+#                         ap1_position = seed.mol.GetConformer().GetPositions()[attach_point]
+#                         neigh2_position = fragment.mol.GetConformer().GetPositions()[neigh_id2]
+#                         cond1 = ap1_position.tolist() == neigh2_position.tolist()
+#                         ap2_position = fragment.mol.GetConformer().GetPositions()[attach_point2]
+#                         neigh1_position = seed.mol.GetConformer().GetPositions()[neigh_id1]
+#                         cond2 = ap2_position.tolist() == neigh1_position.tolist()
+#                         if cond1 and cond2:
+#                             return (neigh_id1, attach_point, neigh_id2, attach_point2)
+                                
+#     except Exception as e:
+#         print(str(e))
+#         import pdb;pdb.set_trace()
+#     return None
+
+
+def find_broken_bond(ligand: Mol, 
+                     seed: Fragment, 
+                     fragment: Fragment, 
+                     seed_mapping: list[list[int]],
+                     fragment_mapping: list[list[int]]):
+    try:
+        # if Chem.MolToSmiles(seed.mol) == '[3*]O[3*]' and Chem.MolToSmiles(fragment.mol) == '[1*]C([1*])=O':
+        #     import pdb;pdb.set_trace()
+        for attach_point, label in seed.get_attach_points().items():
+            broken_bond = find_broken_bond_for_attach(attach_point, 
+                                                      label, 
+                                                      ligand, 
+                                                      seed, 
+                                                      fragment, 
+                                                      seed_mapping, 
+                                                      fragment_mapping)
+            if broken_bond is not None:
+                return broken_bond
+            
+                                
+    except Exception as e:
+        print(str(e))
+        import pdb;pdb.set_trace()
+    return None
+    
+    
+def find_broken_bond_for_attach(attach_point: int,
+                                label: int,
+                                ligand: Mol, 
+                                seed: Fragment, 
+                                fragment: Fragment, 
+                                seed_mapping: list[list[int]],
+                                fragment_mapping: list[list[int]]):
+    
+    neigh_id1 = get_neighbor_id_for_atom_id(seed.mol, attach_point)
+    native_neigh_id1 = seed_mapping[neigh_id1]
+    # native_ap1 = mapping1[attach_point]
+    for attach_point2, label2 in fragment.get_attach_points().items():
+        neigh_id2 = get_neighbor_id_for_atom_id(fragment.mol, attach_point2)
+        native_neigh_id2 = fragment_mapping[neigh_id2]
+        # native_ap2 = mapping2[attach_point2]
+
+        potential_reactions_seed = potential_reactions[label]
+        if label2 in potential_reactions_seed:
+            bond = ligand.GetBondBetweenAtoms(native_neigh_id1, native_neigh_id2)
+            if bond is not None:
+                ap1_position = seed.mol.GetConformer().GetPositions()[attach_point]
+                neigh2_position = fragment.mol.GetConformer().GetPositions()[neigh_id2]
+                cond1 = ap1_position.tolist() == neigh2_position.tolist()
+                ap2_position = fragment.mol.GetConformer().GetPositions()[attach_point2]
+                neigh1_position = seed.mol.GetConformer().GetPositions()[neigh_id1]
+                cond2 = ap2_position.tolist() == neigh1_position.tolist()
+                if cond1 and cond2:
+                    return (neigh_id1, attach_point, neigh_id2, attach_point2)
+                
+    return None
     
 def get_fragments_from_mol(mol: Mol) -> list[Fragment]:
     
@@ -103,42 +202,195 @@ def get_fragments_from_mol(mol: Mol) -> list[Fragment]:
     
     pieces = Chem.BRICS.BreakBRICSBonds(mol)
     frags_mol_atom_mapping = []
-    frags = Chem.GetMolFrags(pieces, asMols=True, fragsMolAtomMapping=frags_mol_atom_mapping)
+    fragments: list[Mol] = Chem.GetMolFrags(pieces, asMols=True, fragsMolAtomMapping=frags_mol_atom_mapping)
 
-    for frag in frags:
+    for frag in fragments:
         Chem.AssignStereochemistryFrom3D(frag)
+        
+    fragments: list[Fragment] = [Fragment(frag) for frag in fragments]
 
-    # for frag in frags:
-    #     if frag.GetNumHeavyAtoms() == 1:
-    #         import pdb;pdb.set_trace()
+    # no_attach_mappings = []
+    # for mapping, fragment in zip(frags_mol_atom_mapping, fragments):
+    #     no_attach_mappings.append(get_no_attach_mapping(mapping, fragment))
+        
+    # frags_mol_atom_mapping = no_attach_mappings
 
-    no_attach_mappings = []
-    for mapping in frags_mol_atom_mapping:
-        no_attach_mappings.append(get_no_attach_mapping(mapping, mol))
+    # Re-attach fragments with only one atom
+    # bonds_to_link = {}
+    # new_frags = []
+    # merged_frag_idxs = []
+    # new_mappings = []
     
-    # get canonical order
+    frag_i = 0
+    while frag_i < len(fragments):
+        frag = fragments[frag_i]
+        if frag.mol.GetNumHeavyAtoms() == 1 and len(frag.get_attach_points()) == 1:
+            for frag_i2 in range(len(fragments)):
+                if frag_i != frag_i2:
+                    frag2 = fragments[frag_i2]
+                    mapping1 = frags_mol_atom_mapping[frag_i]
+                    mapping2 = frags_mol_atom_mapping[frag_i2]
+                    broken_bond = find_broken_bond(mol, frag, frag2,
+                                                   mapping1, mapping2)
+                    if broken_bond is not None:
+                        # if Chem.MolToSmiles(frag.mol) == '[3*]O[H]':
+                        #     import pdb;pdb.set_trace()
+                        neigh1_id, ap1_id, neigh2_id, ap2_id = broken_bond
+                        # if frag_i > frag_i2:
+                        #     frag_i, frag_i2 = frag_i2, frag_i
+                        #     ap1_id, ap2_id = ap2_id, ap1_id
+                        # frag1 = fragments[frag_i]
+                        # frag2 = fragments[frag_i2]
+                        frag.protect(atom_ids_to_keep=[ap1_id])
+                        frag2.protect(atom_ids_to_keep=[ap2_id])
+                        
+                        product, seed_to_product_mapping, fragment_to_product_mapping = add_fragment_to_seed(frag, frag2)
+                        # seed_to_product_mapping = get_no_attach_mapping(seed_to_product_mapping, frag)
+                        # fragment_to_product_mapping = get_no_attach_mapping(fragment_to_product_mapping, frag2)
+                        
+                        new_mapping = merge_mappings(mapping1,
+                                                     mapping2,
+                                                     seed_to_product_mapping,
+                                                     fragment_to_product_mapping,
+                                                     ap1_id,
+                                                     ap2_id)
+                        
+                        # new_mapping1 = [mapping1[]seed_to_product_mapping[i] for i in mapping1]
+                        # mapping2 = no_attach_mappings[frag_i2]
+                        # new_mapping2 = [fragment_to_product_mapping[i] for i in mapping2]
+                        # new_mapping = new_mapping1 + new_mapping2
+                        if frag_i < frag_i2:
+                            frag_i, frag_i2 = frag_i2, frag_i
+                        fragments[frag_i] = product
+                        frags_mol_atom_mapping[frag_i] = new_mapping
+                        
+                        fragments.pop(frag_i2)
+                        frags_mol_atom_mapping.pop(frag_i2)
+                        
+                        if frag_i > frag_i2:
+                            frag_i -= 1 # because we removed the small fragment that was on the right side
+                        break
+                        
+        frag_i += 1
+    
+    # for frag_i, frag in enumerate(frags):
+    #     if frag.mol.GetNumHeavyAtoms() == 1:
+    #         for frag_i2, frag2 in enumerate(frags):
+    #             if frag_i != frag_i2:
+    #                 broken_bond = find_broken_bond(mol, 
+    #                                                frag, frag_i, 
+    #                                                frag2, frag_i2, 
+    #                                                frags_mol_atom_mapping)
+    #                 if broken_bond is not None:
+    #                     neigh1_id, ap1_id, neigh2_id, ap2_id = broken_bond
+    #                     bond_to_link = (ap1_id, frag_i2, ap2_id)
+    #                     bonds_to_link[frag_i] = bond_to_link
+    #                     merged_frag_idxs.append(frag_i2)
+    #                     break
+    #     else:
+    #         if frag_i not in merged_frag_idxs:
+    #             new_frags.append(frag)
+    #             new_mappings.append(frags_mol_atom_mapping[frag_i])
+    
+    # for frag_i, bond in bonds_to_link.items():
+    #     ap1_id, frag_i2, ap2_id = bond
+    #     frag1 = frags[frag_i]
+    #     frag2 = frags[frag_i2]
+    #     frag1.protect(atom_ids_to_keep=[ap1_id])
+    #     frag2.protect(atom_ids_to_keep=[ap2_id])
+    #     new_frag = add_fragment_to_seed(frag1, frag2)
+    #     new_frags.append(new_frag)
+    #     new_mapping = no_attach_mappings[frag_i] + no_attach_mappings[frag_i2]
+    #     new_mappings.append(new_mapping)
+    
+    # fragments = new_frags
+    # frags_mol_atom_mapping = new_mappings
+    
+    # get canon order of canon fragments
     min_idxs = []
     for mapping in frags_mol_atom_mapping:
         min_idx = min(mapping)
         min_idxs.append(min_idx)
         
     sort_idx = np.argsort(min_idxs)
-    fragments = [Fragment(frags[i]) for i in sort_idx]
-    frags_mol_atom_mapping = [no_attach_mappings[i] for i in sort_idx]
+    final_fragments = []
+    final_mappings = []
+    for fragment_i in sort_idx:
+        current_fragment = fragments[fragment_i]
+        current_mapping = frags_mol_atom_mapping[fragment_i]
+        final_fragment, final_mapping = get_canon_fragment(current_fragment, 
+                                                           current_mapping)
+        final_fragments.append(final_fragment)
+        final_mappings.append(final_mapping)
     
-    return fragments, frags_mol_atom_mapping
+    return final_fragments, final_mappings
+
+
+def merge_mappings(mapping1: list[int],
+                   mapping2: list[int],
+                   seed_to_product_mapping: list[int],
+                   fragment_to_product_mapping: list[int],
+                   ap_seed: int,
+                   ap_fragment: int) -> list[int]:
+    new_mapping_size = len(mapping1) + len(mapping2) - 2
+    new_mapping = [None] * new_mapping_size
+                        
+    try:
+        for seed_i, product_i in enumerate(seed_to_product_mapping):
+            if seed_i != ap_seed:
+                new_mapping[product_i] = mapping1[seed_i]
+        for seed_i, product_i in enumerate(fragment_to_product_mapping):
+            if seed_i != ap_fragment:
+                new_mapping[product_i] = mapping2[seed_i]
+    except:
+        import pdb;pdb.set_trace()
+        
+    if not all([m is not None for m in new_mapping]):
+        import pdb;pdb.set_trace()
+        
+    return new_mapping
+
+
+def get_canon_fragment(frag: Fragment,
+                       frags_mol_atom_mapping: list[int]) -> Fragment:
+    # assert len(frag.get_attach_points()) == 1
+    # frag_h = Chem.AddHs(frag.mol, addCoords=True)
+    # assert len(frag_h.GetAtoms()) == len(frag.mol.GetAtoms())
+    smiles = Chem.MolToSmiles(frag.mol)
+    ps = Chem.SmilesParserParams()
+    ps.removeHs = False
+    canon_mol = Chem.MolFromSmiles(smiles, ps)
+    # canon_mol = Chem.AddHs(canon_mol)
+    one2two = canon_mol.GetSubstructMatch(frag.mol)
+    if len(one2two) != frag.mol.GetNumAtoms():
+        import pdb;pdb.set_trace()
+    mol_copy = Mol(frag.mol)
+    canon_mol.AddConformer(mol_copy.GetConformer())
+    for atom_id1, atom_id2 in enumerate(one2two):
+        point3d = frag.mol.GetConformer().GetAtomPosition(atom_id1)
+        try:
+            canon_mol.GetConformer().SetAtomPosition(atom_id2, point3d)
+        except:
+            import pdb;pdb.set_trace()
+    canon_frags_mol_atom_mapping = [None] * canon_mol.GetNumAtoms()
+    for one_i, two_i in enumerate(one2two):
+        canon_frags_mol_atom_mapping[two_i] = frags_mol_atom_mapping[one_i]
+    canon_frag = Fragment(canon_mol)
+    # if smiles != Chem.MolToSmiles(canon_frag.mol):
+    #     import pdb;pdb.set_trace()
+    return canon_frag, canon_frags_mol_atom_mapping
 
 
 def get_unique_fragments_from_mols(mols: list[Mol]) -> list[Fragment]:
     
     smiles_fragments = {}
     smiles_counter = Counter()
-    for mol in mols:
+    for mol in tqdm(mols):
         fragments, frags_mol_atom_mapping = get_fragments_from_mol(mol)
         if len(fragments) > 1:
             for i, frag in enumerate(fragments):
                 attach_points = frag.get_attach_points()
-                frag_mol = frag.to_mol()
+                frag_mol = frag.mol
                 if len(attach_points) > 0:
                     Chem.SanitizeMol(frag_mol)
                     smiles = Chem.MolToSmiles(frag_mol, 
@@ -237,7 +489,7 @@ def center_fragment(fragment: Fragment,
                     attach_to_neighbor: bool = True,
                     neighbor_is_zero: bool = True) -> list[Union[np.ndarray, Rotation]]:
     assert len(fragment.get_attach_points()) == 1
-    mol = fragment.to_mol()
+    mol = fragment.mol
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() == 0:
             attach_point = atom
@@ -280,7 +532,7 @@ def center_fragment(fragment: Fragment,
 def get_masks(final_fragments: list[Fragment]):
     fragment_attach_labels = []
     for act_i, fragment in enumerate(final_fragments):
-        mol = fragment.to_mol()
+        mol = fragment.mol
         for atom in mol.GetAtoms():
             if atom.GetAtomicNum() == 0:
                 attach_label = atom.GetIsotope()
@@ -306,7 +558,7 @@ def select_mol_with_symbols(mols: list[Union[Mol, Fragment]],
         if isinstance(mol, Fragment):
             frag = Fragment.from_fragment(mol)
             frag.unprotect()
-            mol = frag.to_mol()
+            mol = frag.mol
         mol = Chem.RemoveHs(mol)
         included = True
         for atom in mol.GetAtoms():
@@ -327,20 +579,22 @@ def get_rotated_fragments(protected_fragments,
                             torsion_angles_deg: list[float]) -> dict[str, Fragment]:
         
     print('Rotate fragments')
-    rotated_fragments = []
-    for protected_fragment in tqdm(protected_fragments):
+    all_rotated_fragments = []
+    for protected_fragment in protected_fragments:
+        rotated_fragments = []
         for torsion_value in torsion_angles_deg:
             new_fragment = Fragment.from_fragment(protected_fragment)
             rotation = Rotation.from_euler('x', torsion_value, degrees=True)
-            rotate_conformer(new_fragment.to_mol().GetConformer(), rotation)
+            rotate_conformer(new_fragment.mol.GetConformer(), rotation)
             rotated_fragments.append(new_fragment)
+        all_rotated_fragments.append(rotated_fragments)
             
-    return rotated_fragments
+    return all_rotated_fragments
 
 def get_neighbor_symbol(fragment: Fragment):
     aps = fragment.get_attach_points()
     ap_atom_id = list(aps.keys())[0]
-    ap_atom = fragment.to_mol().GetAtomWithIdx(ap_atom_id)
+    ap_atom = fragment.mol.GetAtomWithIdx(ap_atom_id)
     neighbors = ap_atom.GetNeighbors()
     assert len(neighbors) == 1
     return neighbors[0].GetSymbol()

@@ -12,6 +12,7 @@ from ymir.params import (CNN_RADIUS, N_INTERACTION_BLOCKS, L_MAX,
                          NUMBER_OF_BASIS,
                          MOL_ID_EMBEDDING_SIZE,
                         NODE_Z_EMBEDDING_SIZE,
+                        FOCAL_EMBEDDING_SIZE,
                         MIDDLE_LAYER_SIZE,
                         MAX_NUMBER_TYPES,
                         NEIGHBOR_RADIUS)
@@ -78,6 +79,7 @@ class CNN(torch.nn.Module):
                  num_elements: int,
                  node_z_embedding_size: int = NODE_Z_EMBEDDING_SIZE,
                  node_mol_embedding_size: int = MOL_ID_EMBEDDING_SIZE,
+                 focal_embedding_size: int = FOCAL_EMBEDDING_SIZE,
                  lmax: int = L_MAX,
                  max_radius: float = CNN_RADIUS,
                  number_of_basis: int = NUMBER_OF_BASIS,
@@ -91,6 +93,7 @@ class CNN(torch.nn.Module):
         self.num_elements = num_elements
         self.node_z_embedding_size = node_z_embedding_size
         self.node_mol_embedding_size = node_mol_embedding_size
+        self.focal_embedding_size = focal_embedding_size
         self.lmax = lmax
         self.max_radius = max_radius
         self.number_of_basis = number_of_basis
@@ -99,10 +102,14 @@ class CNN(torch.nn.Module):
         
         self.node_z_embedder = torch.nn.Embedding(num_embeddings=self.num_elements, 
                                                   embedding_dim=self.node_z_embedding_size)
-        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=2, # seed, pocket or fragment
+        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=3, # seed, pocket or fragment
                                                     embedding_dim=self.node_mol_embedding_size)
+        self.focal_embedder = torch.nn.Embedding(num_embeddings=2, # focal or not
+                                                embedding_dim=self.focal_embedding_size)
         
-        self.node_embedding_size = self.node_z_embedding_size + self.node_mol_embedding_size
+        self.node_embedding_size = self.node_z_embedding_size \
+            + self.node_mol_embedding_size \
+                + self.focal_embedding_size
         self.irreps_input_node = o3.Irreps(f'{self.node_embedding_size}x0e')
         
         self.irreps_sh = o3.Irreps.spherical_harmonics(lmax)
@@ -135,11 +142,13 @@ class CNN(torch.nn.Module):
         x = batch.x
         pos = batch.pos
         mol_id = batch.mol_id
+        is_focal = batch.is_focal
         
         x = self.node_z_embedder(x)
         mol_id = self.node_mol_embedder(mol_id)
+        is_focal = self.focal_embedder(is_focal)
         
-        x = torch.cat([x, mol_id], dim=-1)
+        x = torch.cat([x, mol_id, is_focal], dim=-1)
         
         for block_i, interaction_block in enumerate(self.interaction_blocks):
             
@@ -180,12 +189,16 @@ class CNN(torch.nn.Module):
             
             x = new_x
             
-        # return x
+        return x
             
-        output = scatter(x,
-                         batch.batch,
-                         dim=0,
-                         reduce='mean')
+        # output = scatter(x,
+        #                  batch.batch,
+        #                  dim=0,
+        #                  reduce='mean')
 
-        return output
+        # return output
     
+    
+    def get_atomic_contributions(self,
+                                 batch: Batch):
+        return self.forward(batch)

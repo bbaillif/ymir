@@ -50,3 +50,12 @@ def rdkit_distance_matrix(mol1: Conformer, mol2: Conformer) -> np.ndarray:
     combined_mol = Chem.CombineMols(mol1, mol2)
     distance_matrix = Chem.Get3DDistanceMatrix(combined_mol)
     return distance_matrix
+
+
+def add_noise(conformer: Conformer,
+              noise_std: float = 0.01):
+    num_atoms = conformer.GetNumAtoms()
+    for i in range(num_atoms):
+        initial_pos = conformer.GetAtomPosition(i)
+        noisy_pos = initial_pos + noise_std * np.random.randn(3)
+        conformer.SetAtomPosition(i, noisy_pos)

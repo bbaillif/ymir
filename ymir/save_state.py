@@ -5,8 +5,7 @@ from ymir.utils.spatial import Transformation
 
 class StateSave(NamedTuple):
     score: float
+    rmsd: float
     seed: Fragment
-    pocket_mol: Mol
-    transformations: list[Transformation]
     
 Memory = dict[tuple, StateSave]

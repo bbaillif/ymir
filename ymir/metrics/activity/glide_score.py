@@ -4,6 +4,8 @@ import subprocess
 import numpy as np
 import pandas as pd
 import time
+import gzip
+import shutil
 
 from rdkit import Chem
 from rdkit.Chem import Mol
@@ -18,7 +20,7 @@ class GlideScore():
                  reference_score: float = 0,
                  name: str = 'Glide score',
                  mininplace: bool = False,
-                 default_value: int = 100,
+                 default_value: int = np.nan,
                  ) -> None:
         self.name = name
         self.scores = {}
@@ -38,6 +40,14 @@ class GlideScore():
         
         self.results_filepath = os.path.join(self.glide_output_dirpath,
                                              'glide_scoring.csv')
+        
+        self.pose_gz_filename = 'glide_scoring_raw.sdfgz'
+        self.pose_gz_filepath = os.path.join(self.glide_output_dirpath,
+                                            self.pose_gz_filename)
+        
+        self.pose_filename = 'glide_scoring_raw.sdf'
+        self.pose_filepath = os.path.join(self.glide_output_dirpath,
+                                            self.pose_filename)
         
         if os.path.exists(self.glide_in_filepath):
             os.remove(self.glide_in_filepath)
@@ -103,6 +113,11 @@ class GlideScore():
                 mol.SetProp('_Name', glide_name)
                 writer.write(mol)
                    
+        if os.path.exists(self.pose_gz_filepath):
+            os.remove(self.pose_gz_filepath)
+        if os.path.exists(self.pose_filepath):
+            os.remove(self.pose_filepath)
+                   
         # if os.path.exists(self.glide_in_filepath):
         #     os.remove(self.glide_in_filepath)
         # self.generate_glide_in_file() # in case we have different configuration, e.g. inplace and mininplace
@@ -117,7 +132,7 @@ class GlideScore():
             for glide_name in glide_names:
                 name_result = self.scores_df[self.scores_df['title'] == glide_name]
                 if name_result.shape[0] == 0:
-                    logging.info(f'No Glide result for {glide_name}')
+                    logging.debug(f'No Glide result for {glide_name}')
                     all_scores.append(self.default_value)
                 else:
                     all_scores.append(name_result['r_i_docking_score'].values[0])
@@ -127,6 +142,12 @@ class GlideScore():
         else:
             logging.warning('Cannot find docking results')
             all_scores = [self.default_value] * len(mols)
+        
+        # Find best pose for each action
+        if os.path.exists(self.pose_gz_filepath):
+            with gzip.open(self.pose_gz_filepath, 'rb') as f_in:
+                with open(self.pose_filepath, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
         
         # if len(all_scores) != cel.n_total_confs:
         #     import pdb;pdb.set_trace()
@@ -138,8 +159,10 @@ class GlideScore():
         logging.info(f'Preparing Glide docking input in {self.glide_in_filepath}')
         if self.mininplace:
             docking_method = 'mininplace'
+            flextors = 'True'
         else:
             docking_method = 'inplace'
+            flextors = 'False'
         
         d = {'GRIDFILE': self.glide_protein.grid_filepath,
              'OUTPUTDIR': self.glide_output_dirpath,
@@ -149,7 +172,7 @@ class GlideScore():
              'LIGANDFILE': self.ligands_filepath,
              'POSTDOCK': 'False',
              'NOSORT': 'True',
-             'FLEXTORS': 'False'}
+             'FLEXTORS': flextors}
         with open(self.glide_in_filepath, 'w') as f:
             for param_name, value in d.items():
                 f.write(f'{param_name}   {value}')
