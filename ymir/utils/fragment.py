@@ -529,22 +529,14 @@ def center_fragment(fragment: Fragment,
     return transformations
 
 
-def get_masks(final_fragments: list[Fragment]):
-    fragment_attach_labels = []
-    for act_i, fragment in enumerate(final_fragments):
-        mol = fragment.mol
-        for atom in mol.GetAtoms():
-            if atom.GetAtomicNum() == 0:
-                attach_label = atom.GetIsotope()
-                break
-        fragment_attach_labels.append(attach_label)
+def get_masks(attach_labels: list[list[int]]):
 
     valid_action_masks: dict[int, list[bool]] = {}
     for attach_label_1, d_potential_attach in potential_reactions.items():
-        mask = [True 
-                if attach_label in d_potential_attach 
-                else False
-                for attach_label in fragment_attach_labels]
+        mask = []
+        for attach_labels_2 in attach_labels:
+            mask.append(any([attach_label_2 in d_potential_attach 
+                             for attach_label_2 in attach_labels_2]))
                 
         valid_action_masks[attach_label_1] = torch.tensor(mask, dtype=torch.bool)
         

@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import glob
 import subprocess
 import logging
@@ -142,19 +143,34 @@ class SminaCLI():
         for f in old_poses_files:
             os.remove(f)
             
+        receptor_to_ligand_i = {}
         receptor_ligands = {}
-        for ligand, receptor in zip(ligands, receptor_paths):
+        for ligand_i, (ligand, receptor) in enumerate(zip(ligands, receptor_paths)):
             if receptor in receptor_ligands:
                 receptor_ligands[receptor].append(ligand)
+                receptor_to_ligand_i[receptor].append(ligand_i)
             else:
                 receptor_ligands[receptor] = [ligand]
+                receptor_to_ligand_i[receptor] = [ligand_i]
         n_receptors = len(receptor_ligands)
             
         self.write_ligands(receptor_ligands)
+        
+        new2old_ligand_i = []
+        for receptor_path, ligand_idxs in receptor_to_ligand_i.items():
+            new2old_ligand_i.extend(ligand_idxs)
+            
+        self.new2old = new2old_ligand_i
+        self.old2new = np.argsort(new2old_ligand_i)
+        
         base_smina_cmd = self.get_base_smina_cmd()
         
+        if len(receptor_ligands) == 1:
+            receptor_paths = [receptor_paths[0] for _ in self.ligand_paths]
+        else:
+            receptor_paths = list(receptor_ligands.keys())
         smina_commands = []
-        for ligand_path, receptor_path in zip(self.ligand_paths, list(receptor_ligands.keys())):
+        for ligand_path, receptor_path in zip(self.ligand_paths, receptor_paths):
             smina_command = self.get_ligand_smina_cmd(base_smina_cmd, 
                                                     receptor_path, 
                                                     ligand_path)
@@ -179,7 +195,10 @@ class SminaCLI():
             
         logging.info('Smina CLI finished')
         
-        assert len(all_scores) == len(ligands)
+        if len(all_scores) != len(ligands):
+            import pdb;pdb.set_trace()
+        
+        all_scores = [all_scores[i] for i in self.old2new]
         
         return all_scores
             
@@ -195,15 +214,36 @@ class SminaCLI():
             
         # batches = [ligands]
         # batches = [[ligand] for ligand in ligands]
-            
+           
         ligand_paths = []
-        for i, receptor in enumerate(receptor_ligands):
-            ligands = receptor_ligands[receptor]
-            ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
-            with Chem.SDWriter(ligand_path) as writer:
-                for ligand in ligands:
-                    writer.write(ligand)
-            ligand_paths.append(ligand_path)
+            
+        if len(receptor_ligands) == 1 and len(receptor_ligands[list(receptor_ligands.keys())[0]]) >= self.n_threads:
+            ligands = receptor_ligands[list(receptor_ligands.keys())[0]]
+            batch_size = (len(ligands) // self.n_threads)
+            modulo = len(ligands) % self.n_threads
+            start = 0 
+            for i in range(self.n_threads):
+                if i < modulo:
+                    current_batch_size = batch_size + 1
+                else:
+                    current_batch_size = batch_size
+                end = start + current_batch_size
+                batch = ligands[start:end]
+                ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
+                with Chem.SDWriter(ligand_path) as writer:
+                    for ligand in batch:
+                        writer.write(ligand)
+                ligand_paths.append(ligand_path)
+                start = end
+            
+        else:
+            for i, receptor in enumerate(receptor_ligands):
+                ligands = receptor_ligands[receptor]
+                ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
+                with Chem.SDWriter(ligand_path) as writer:
+                    for ligand in ligands:
+                        writer.write(ligand)
+                ligand_paths.append(ligand_path)
         
         # import pdb;pdb.set_trace()
         
@@ -259,6 +299,8 @@ class SminaCLI():
         #     if pose_mol is None:
         #         import pdb;pdb.set_trace()
         #     poses.append(pose_mol)
+
+        all_poses = [all_poses[i] for i in self.old2new]
 
         return all_poses
         

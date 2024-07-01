@@ -103,7 +103,7 @@ class Fragment():
         
         try:
             Chem.SanitizeMol(self.mol) # Necessary to set the ExplicitHs number correct for attach points
-            # Chem.AssignStereochemistryFrom3D(self.mol)
+            Chem.AssignStereochemistryFrom3D(self.mol) # Recompute the stereo for future matching
         except Exception as e:
             print(str(e))
             import pdb; pdb.set_trace()
@@ -137,3 +137,12 @@ class Fragment():
             new_index = heavy_atom_ids.index(attach_point)
             new_protections[new_index] = label
         self.protections = new_protections
+        
+        
+    def set_attach_label(self,
+                         label: int):
+        attach_points = self.get_attach_points()
+        assert len(attach_points) == 1
+        attach_point = list(attach_points.keys())[0]
+        attach_atom = self.mol.GetAtomWithIdx(attach_point)
+        attach_atom.SetIsotope(label)

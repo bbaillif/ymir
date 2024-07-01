@@ -8,9 +8,11 @@ class Complex():
     
     def __init__(self,
                  ligand: Mol,
-                 protein_path: str) -> None:
+                 protein_path: str,
+                 pocket_path: str) -> None:
         self.ligand = ligand
         self.protein_path = protein_path
+        self.pocket_path = pocket_path
         
         # To be loaded on demand
         self._vina_protein = None

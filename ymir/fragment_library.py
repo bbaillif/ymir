@@ -26,11 +26,11 @@ class FragmentLibrary():
                  removeHs: bool = True,
                  subset: str = 'refined') -> None:
         self.pdbbind = PDBbind()
-        assert subset in ['all', 'refined', 'general'], \
+        assert subset in ['all', 'refined', 'general', 'cross_docked'], \
             'Select one PDBbind subset among all, refined or general'
         self.subset = subset
             
-        self.pdbbind_ligand_path = f'/home/bb596/hdd/ymir/pdbbind_ligands_{self.subset}.sdf'
+        self.pdbbind_ligand_path = f'/home/bb596/hdd/ymir/{self.subset}_ligands.sdf'
         self.fragments_path = f'/home/bb596/hdd/ymir/small_fragments_3D_{self.subset}.sdf' 
         self.removeHs = removeHs
         
@@ -209,49 +209,71 @@ class FragmentLibrary():
                                  max_torsions: int = 1,
                                  n_fragments: int = None,
                                  get_unique: bool = False,
-                                 shuffle: bool = False) -> list[Fragment]:
+                                 shuffle: bool = False,
+                                 remove_hs: bool = True) -> dict[str, tuple[Fragment, list[int]]]:
         
+        fragments = copy.deepcopy(self.fragments)
         if shuffle:
-            protected_fragments = copy.deepcopy(self.protected_fragments)
-            random.shuffle(protected_fragments)
+            random.shuffle(fragments)
+            
+        if remove_hs:
+            for fragment in fragments:
+                fragment.remove_hs()
+            
+        fragments = select_mol_with_symbols(fragments,
+                                            z_list)
         
-        protected_fragments = select_mol_with_symbols(self.protected_fragments,
-                                              z_list)
-
         # Select only fragments with at most max_attach point
         n_attaches = []
-        for fragment in protected_fragments:
-            frag_copy = Fragment.from_fragment(fragment)
-            frag_copy.unprotect()
-            attach_points = frag_copy.get_attach_points()
+        for fragment in fragments:
+            attach_points = fragment.get_attach_points()
             n_attach = len(attach_points)
             n_attaches.append(n_attach)
 
-        protected_fragments = [fragment 
-                            for fragment, n in zip(protected_fragments, n_attaches)
-                            if n <= max_attach]
-                
+        fragments = [fragment 
+                    for fragment, n in zip(fragments, n_attaches)
+                    if n <= max_attach]
+            
+        n_torsions = [CalcNumRotatableBonds(frag.mol) 
+                      for frag in fragments]
+        fragments = [frag 
+                    for frag, n_torsion in zip(fragments, n_torsions) 
+                    if n_torsion <= max_torsions]
+            
         if get_unique:
             unique_fragments = []
-            unique_combos = []
-            for frag in protected_fragments:
+            unique_smiles = []
+            for frag in fragments:
                 mol = frag.mol
-                p_smiles = Chem.MolToSmiles(mol)
-                frag_copy = Fragment.from_fragment(frag)
-                frag_copy.unprotect()
-                up_smiles = Chem.MolToSmiles(frag_copy.mol)
-                combo = (p_smiles, up_smiles)
-                if not combo in unique_combos:
-                    unique_combos.append(combo)
+                up_smiles = Chem.MolToSmiles(mol)
+                if not up_smiles in unique_smiles:
+                    unique_smiles.append(up_smiles)
                     unique_fragments.append(frag)
                     
-            protected_fragments = unique_fragments
+        fragments = unique_fragments
             
-        n_torsions = [CalcNumRotatableBonds(frag.mol) for frag in protected_fragments]
-        protected_fragments = [frag for frag, n_torsion in zip(protected_fragments, n_torsions) if n_torsion <= max_torsions]
+        protected_fragments: dict[str, list] = {}
+        for fragment in fragments:
+            attach_points = fragment.get_attach_points()
+            if not 7 in list(attach_points.values()): # "7 double bond 7" reaction does not work for some reason...
+                for atom_id, label in attach_points.items():
+                    protected_fragment = Fragment.from_fragment(fragment)
+                    protected_fragment.protect(atom_ids_to_keep=[atom_id])
+                    
+                    reverse_protected_fragment = Fragment.from_fragment(fragment)
+                    atom_ids_to_keep = list(range(0, fragment.mol.GetNumAtoms()))
+                    atom_ids_to_keep.remove(atom_id)
+                    reverse_protected_fragment.protect(atom_ids_to_keep=atom_ids_to_keep)
+                    
+                    rev_protected_smiles = Chem.MolToSmiles(reverse_protected_fragment.mol)
+                    if not rev_protected_smiles in protected_fragments:
+                        protected_fragments[rev_protected_smiles] = [protected_fragment, [label]]
+                    else:
+                        if not label in protected_fragments[rev_protected_smiles][1]:
+                            protected_fragments[rev_protected_smiles][1].append(label)
             
         if n_fragments is not None:
-            protected_fragments = protected_fragments[:n_fragments]
+            protected_fragments = {k: v for k, v in list(protected_fragments.items())[:n_fragments]}
             
         return protected_fragments
 

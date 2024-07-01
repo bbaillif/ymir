@@ -141,7 +141,7 @@ def add_fragment_to_seed(seed: Fragment,
     fragment_attach_label: int = list(fragment_attach_points.values())[0]
     potential_reactions_seed = potential_reactions[seed_attach_label]
     
-    assert fragment_attach_label in potential_reactions_seed
+    assert fragment_attach_label in potential_reactions_seed, 'Fragment attach label must be in potential reactions for seed'
     
     rxn_i, bond_type = potential_reactions_seed[fragment_attach_label]
     rxn = reactions[rxn_i]

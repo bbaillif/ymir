@@ -98,12 +98,21 @@ if SCORING_FUNCTION == 'glide':
 
 n_fragments = 100
 # Remove fragment having at least one heavy atom not in list
-protected_fragments = fragment_library.get_restricted_fragments(z_list, 
+restricted_fragments = fragment_library.get_restricted_fragments(z_list, 
                                                                 max_attach=4, 
                                                                 max_torsions=2,
                                                                 n_fragments=n_fragments,
                                                                 get_unique=True
                                                                 )
+    
+synthon_smiles: list[str] = []
+protected_fragments: list[Fragment] = []
+attach_labels: list[list[int]] = []
+for smiles, t in restricted_fragments.items():
+    fragment, labels = t
+    synthon_smiles.append(smiles)
+    protected_fragments.append(fragment)
+    attach_labels.append(labels)
     
 if SCORING_FUNCTION == 'smina':
     for pfrag in protected_fragments:
@@ -111,8 +120,6 @@ if SCORING_FUNCTION == 'smina':
                     for atom_id in pfrag.protections.keys()])
         # pfrag.mol.Debug()
         pfrag.remove_hs()
-    
-    # Add a removehs function to Fragment to handle change of protections atom id
     
 # for fragment in protected_fragments:
 #     Chem.SanitizeMol(fragment.mol)

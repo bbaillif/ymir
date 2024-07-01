@@ -18,20 +18,21 @@ from ymir.molecule_builder import add_fragment_to_seed
 
 
 def get_frag_i(fragment: Fragment, 
-               atom_id_to_keep: int,
-               smiles_combos: list[tuple[str, str]]):
+               attach_atom_id: int,
+               synthon_smiles: list[str],
+               attach_labels: list[list[int]]):
     frag_copy = Fragment.from_fragment(fragment)
     up_smiles = Chem.MolToSmiles(frag_copy.mol)
     # if up_smiles == '[1*]C([6*])=O':
     #     import pdb;pdb.set_trace()
-    frag_copy.protect([atom_id_to_keep])
-    p_smiles = Chem.MolToSmiles(frag_copy.mol)
-    combo = (p_smiles, up_smiles)
-    idxs = [i for i, smiles_combo in enumerate(smiles_combos) if smiles_combo == combo]
-    if len(idxs) != 1:
-        import pdb;pdb.set_trace()
+    assert len(frag_copy.protections) == 0
+    label = frag_copy.get_attach_points()[attach_atom_id]
+    atom_ids_to_keep = [atom_id for atom_id in range(frag_copy.mol.GetNumAtoms()) if atom_id != attach_atom_id]
+    frag_copy.protect(atom_ids_to_keep=atom_ids_to_keep)
+    s_smiles = Chem.MolToSmiles(frag_copy.mol)
     try:
-        frag_i = smiles_combos.index(combo)
+        frag_i = synthon_smiles.index(s_smiles)
+        assert label in attach_labels[frag_i]
     except Exception as e:
         print(str(e))
         import pdb;pdb.set_trace()
@@ -78,7 +79,8 @@ def get_path(ligand: Mol,
              initial_frag_i: int,
              frag_idxs: list[int],
              frags_mol_atom_mapping: list[list[int]],
-             smiles_combos: list[tuple[str, str]]):
+             synthon_smiles: list[str],
+             attach_labels: list[list[int]]):
     placed_fragments_i = [initial_frag_i]
     seed = Fragment.from_fragment(fragments[initial_frag_i])
     seed_mapping = frags_mol_atom_mapping[initial_frag_i]
@@ -104,8 +106,9 @@ def get_path(ligand: Mol,
                     neigh_id1, attach_point, neigh_id2, attach_point2 = broken_bond
                     # attach_position = seed.mol.GetConformer().GetPositions()[attach_point]
                     master_frag_i = get_frag_i(other_fragment, 
-                                                atom_id_to_keep=attach_point2,
-                                                smiles_combos=smiles_combos)
+                                                attach_atom_id=attach_point2,
+                                                synthon_smiles=synthon_smiles,
+                                                attach_labels=attach_labels)
                     # if master_frag_i == 4 and ligand_name == '6t1j_ligand':
                     #     import pdb;pdb.set_trace()
                     # action = (attach_position, master_frag_i)
@@ -133,7 +136,8 @@ def get_paths(ligand: Mol,
               lp_pdbbind_subsets: dict[str, str],
               glide_not_working_pdb_ids: list[str],
               frags_mol_atom_mapping,
-              smiles_combos):
+              synthon_smiles: list[str],
+              attach_labels: list[list[int]]):
     seeds = []
     generation_sequences = []
     complexes = []
@@ -144,8 +148,9 @@ def get_paths(ligand: Mol,
         if subset == 'train':
             complx = Complex(ligand, protein_path)
             try:
-                glide_protein = GlideProtein(pdb_filepath=complx.vina_protein.protein_clean_filepath,
-                                                native_ligand=complx.ligand)
+                # glide_protein = GlideProtein(pdb_filepath=complx.vina_protein.protein_clean_filepath,
+                #                                 native_ligand=complx.ligand)
+                pass
             except KeyboardInterrupt:
                 import pdb;pdb.set_trace()
             except:
@@ -161,7 +166,8 @@ def get_paths(ligand: Mol,
                                                initial_frag_i, 
                                                frag_idxs, 
                                                frags_mol_atom_mapping,
-                                               smiles_combos)
+                                               synthon_smiles,
+                                               attach_labels)
                     
                     seeds.append(fragments[initial_frag_i])
                     generation_sequences.append(action_sequence)
@@ -174,6 +180,7 @@ def reinforce_episode(agent: Agent,
                         episode_i: int,
                         seed_idxs: list[int], 
                         seeds: list[Fragment],
+                        seed2complex: list[int],
                         complexes: list[Complex],
                         initial_scores: list[float],
                         native_scores: list[float],
@@ -189,16 +196,22 @@ def reinforce_episode(agent: Agent,
                         use_entropy_loss,
                         pocket_feature_type):
     
-    current_seeds = [seeds[seed_i] for seed_i in seed_idxs]
-    current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
-    current_initial_scores = [initial_scores[seed_i] for seed_i in seed_idxs]
-    current_native_scores = [native_scores[seed_i] for seed_i in seed_idxs]
+    current_seeds = []
+    current_complexes = []
+    current_initial_scores = []
+    current_native_scores = []
+    current_generation_paths = []
+    for seed_i in seed_idxs:
+        current_seeds.append(seeds[seed_i])
+        current_complexes.append(complexes[seed2complex[seed_i]])
+        current_initial_scores.append(initial_scores[seed_i])
+        current_native_scores.append(native_scores[seed_i])
+        current_generation_paths.append(generation_sequences[seed_i])
     
     if n_real_data > 0:
         real_data_idxs = np.random.choice(range(len(seed_idxs)), n_real_data, replace=False)
     else:
         real_data_idxs = []
-    current_generation_paths = [generation_sequences[seed_i] for seed_i in seed_idxs]
     
     next_info = batch_env.reset(current_complexes,
                                 current_seeds,
@@ -216,6 +229,8 @@ def reinforce_episode(agent: Agent,
     ep_rewards = []
     ep_entropies = []
     ep_terminateds: list[list[bool]] = [] # (n_steps, n_envs)
+    ep_policies: list[CategoricalMasked] = []
+    ep_actions: list[torch.Tensor] = []
     while step_i < n_max_steps and not all(next_terminated):
         
         current_terminated = next_terminated
@@ -281,6 +296,8 @@ def reinforce_episode(agent: Agent,
         ep_entropies.append(current_action.frag_entropy)
         ep_terminateds.append(current_terminated)
         ep_masks.append(current_masks)
+        ep_policies.append(current_policy)
+        ep_actions.append(current_frag_actions)
         
         step_i += 1
         
@@ -320,6 +337,7 @@ def reinforce_episode(agent: Agent,
     all_logprobs = torch.cat(ep_logprobs)
     all_entropies = torch.cat(ep_entropies)
     all_masks = torch.cat(ep_masks)
+    all_actions = torch.cat(ep_actions)
     
     all_returns = (all_returns - all_returns.mean()) / (all_returns.std() + 1e-5)
     
@@ -328,10 +346,23 @@ def reinforce_episode(agent: Agent,
     n_possible_fragments = all_masks.sum(dim=-1)
     policy_loss = -all_logprobs * all_returns
     if use_entropy_loss:
-        entropy_loss = - all_entropies / n_possible_fragments.log() 
+        normalized_entropies = all_entropies / n_possible_fragments.log()
+        entropy_loss = - normalized_entropies
         loss = policy_loss + entropy_loss * ent_coef
     else:
         loss = policy_loss
+        
+    is_fe = all_actions == 58
+    if is_fe.sum() > 0:  
+        all_probs = all_logprobs.exp()
+        fe_probs = all_probs[is_fe]
+        fe_entropies = normalized_entropies[is_fe]
+        high_prob_high_entropy = (fe_probs > 0.5) & (fe_entropies > 0.75)
+        if torch.any(high_prob_high_entropy):
+            import pdb;pdb.set_trace()
+    
+    # if (episode_i + 1) % 500 == 0:
+    #     import pdb;pdb.set_trace()
         
     loss = loss.mean()
     
@@ -350,6 +381,7 @@ def reinforce_episode(agent: Agent,
     logging.info(f'log(Nfrags): {n_possible_fragments.log()}')
     logging.info(f'Entropy losses: {entropy_loss}')
     
+    return scores
     
     
 def ppo_episode(agent: Agent,

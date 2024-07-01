@@ -4,10 +4,12 @@ import logging
 import io
 import os
 import copy
+import time
 
 from rdkit import Chem
 from rdkit.Chem import Mol
 from ase.io import read
+from ase import Atoms
 from ymir.molecule_builder import add_fragment_to_seed, check_assembly
 from ymir.utils.fragment import (get_fragments_from_mol, 
                                  get_neighbor_symbol, 
@@ -51,12 +53,14 @@ import shutil
 from dscribe.descriptors import SOAP
 from sklearn.preprocessing import normalize
 from ymir.utils.spatial import add_noise
+from ymir.molecule_builder import potential_reactions
 
 
 class FragmentBuilderEnv():
     
     def __init__(self,
                  rotated_fragments: list[list[Fragment]],
+                 attach_labels: list[list[int]],
                  z_table: AtomicNumberTable,
                  max_episode_steps: int = 10,
                  valid_action_masks: dict[int, torch.Tensor] = None,
@@ -64,6 +68,7 @@ class FragmentBuilderEnv():
                  pocket_feature_type: str = 'soap',
                  ) -> None:
         self.rotated_fragments = rotated_fragments
+        self.attach_labels = attach_labels
         self.z_table = z_table
         self.max_episode_steps = max_episode_steps
         self.valid_action_masks = valid_action_masks
@@ -82,6 +87,14 @@ class FragmentBuilderEnv():
         self.geometry_extractor = GeometryExtractor()
         self.featurizer = Featurizer(z_table=self.z_table)
         self.mbd = MedianBondDistance()
+        
+        species = ['C', 'N', 'O', 'Cl', 'S']
+        # if self.embed_hydrogens:
+        #     species = ['H'] + species
+        self.soap = SOAP(species=species,
+                        r_cut=8,
+                        n_max=8,
+                        l_max=6)
         
         
     @property
@@ -109,7 +122,9 @@ class FragmentBuilderEnv():
         self.current_score = initial_score
         self.native_score = native_score
         
-        self.pocket_mol = Mol(self.complex.pocket.mol)
+        # self.pocket_mol = Chem.RemoveHs(self.complex.pocket.mol)
+        self.pocket_mol = Chem.MolFromPDBFile(self.complex.pocket_path, 
+                                              sanitize=False)
         
         self.actions = []
         
@@ -137,6 +152,8 @@ class FragmentBuilderEnv():
         # self.complex_minimizer = ComplexMinimizer(pocket=self.complex.pocket)
         
         self.new_atom_idxs = range(self.seed.mol.GetNumAtoms())
+        
+        
         
         # return observation, info
         return info
@@ -186,30 +203,47 @@ class FragmentBuilderEnv():
         # translate_conformer(neighbor_centred_seed.mol.GetConformer(), translation=-neighbor_position)
         
         new_frag_neigh_position = np.array([ideal_distance, 0, 0]) # cause current neigh position is [0,0,0]
+        rotation, rssd = Rotation.align_vectors(a=neigh_to_focal.reshape(-1, 3), b=new_frag_neigh_position.reshape(-1, 3))
         for new_fragment in fragments:
             attach_points = new_fragment.get_attach_points()
             attach_id = list(attach_points.keys())[0]
             frag_neighbor_id = get_neighbor_id_for_atom_id(mol=new_fragment.mol, 
                                                            atom_id=attach_id)
             
+            # Set fragment attach to [0,0,0] and neighbor to [ideal_distance, 0, 0]
             translate_conformer(new_fragment.mol.GetConformer(), translation=new_frag_neigh_position)
             frag_conf = new_fragment.mol.GetConformer()
             frag_conf.SetAtomPosition(attach_id, Point3D(0, 0, 0))
             
-            # translate_conformer(frag_conf, translation=neighbor_position)
-        
-            rotation, rssd = Rotation.align_vectors(a=neigh_to_focal.reshape(-1, 3), b=new_frag_neigh_position.reshape(-1, 3))
+            # Rotate fragment to align (frag_attach -> frag_neigh) to (seed_neigh -> seed_focal)
             rotate_conformer(frag_conf, rotation=rotation)
             
+            # Translate fragment to superpose seed_focal to frag_neigh
             translate_conformer(frag_conf, translation=neighbor_position)
-            assert np.allclose(frag_conf.GetPositions()[attach_id], neighbor_position)
-            assert np.allclose(frag_conf.GetPositions()[frag_neighbor_id], new_focal_position)
+            try:
+                assert np.allclose(frag_conf.GetPositions()[attach_id], neighbor_position)
+                assert np.allclose(frag_conf.GetPositions()[frag_neighbor_id], new_focal_position)
+            except:
+                import pdb;pdb.set_trace()
         
         
     def action_to_products(self,
                             frag_action: int) -> tuple[list[Fragment], list[list[int]]]:
         
         new_fragments = self.get_new_fragments(frag_action)
+        
+        # Set attach label to a label among the possible for the chosen fragment
+        potential_labels = self.attach_labels[frag_action]
+        seed_label = self.attach_points[self.focal_atom_id]
+        potential_reactions_seed = potential_reactions[seed_label]
+        for potential_label in potential_labels:
+            if potential_label in potential_reactions_seed:
+                # attach_atom = self.seed.mol.GetAtomWithIdx(self.focal_atom_id)
+                # attach_atom.SetIsotope(potential_label)
+                for new_fragment in new_fragments:
+                    attach_atom = new_fragment.mol.GetAtomWithIdx(list(new_fragment.get_attach_points().keys())[0])
+                    attach_atom.SetIsotope(potential_label)
+                break
         
         # seed_mol = Chem.RemoveHs(seed_mol)
         self.fragments_to_frame(new_fragments)
@@ -254,110 +288,137 @@ class FragmentBuilderEnv():
     
     def rdkit_to_ase(self,
                      mol: Mol):
-        filename = 'mol.xyz'
-        Chem.MolToXYZFile(mol, filename)
-        ase_atoms = read(filename)
+        # filename = 'mol.xyz'
+        # Chem.MolToXYZFile(mol, filename)
+        # molblock = Chem.MolToXYZBlock(mol)
+        # f = io.StringIO(molblock)
+        symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        positions = mol.GetConformer().GetPositions()
+        # ase_atoms = read(f)
+        ase_atoms = Atoms(symbols=symbols, positions=positions)
         return ase_atoms
         
     
     def featurize_pocket(self) -> Data:
         center_pos = self.seed.mol.GetConformer().GetAtomPosition(self.focal_atom_id)
         center_pos = np.array([center_pos.x, center_pos.y, center_pos.z])
-        # if self.pocket_feature_type == 'soap':
-        #     seed_copy = Fragment.from_fragment(self.seed)
-        #     seed_copy.protect()
-        #     pocket_copy = Mol(self.pocket_mol)
+        if self.pocket_feature_type == 'soap':
+            seed_copy = Fragment.from_fragment(self.seed)
+            seed_copy.protect()
+            pocket_copy = Mol(self.pocket_mol)
             
-        #     add_noise(seed_copy.mol.GetConformer())
-        #     add_noise(pocket_copy.GetConformer())
+            add_noise(seed_copy.mol.GetConformer())
+            add_noise(pocket_copy.GetConformer())
             
-        #     seed_atoms = self.rdkit_to_ase(seed_copy.mol)
-        #     pocket_atoms = self.rdkit_to_ase(pocket_copy)
-        #     if not self.embed_hydrogens:
-        #         seed_atoms = seed_atoms[[atom.index for atom in seed_atoms if atom.symbol != 'H']]
-        #         pocket_atoms = pocket_atoms[[atom.index for atom in pocket_atoms if atom.symbol != 'H']]
+            distance_matrix = rdkit_distance_matrix(seed_copy.mol, pocket_copy)
+            distance_to_center = distance_matrix[:, self.focal_atom_id]
+            seed_dist_to_center = distance_to_center[:seed_copy.mol.GetNumAtoms()]
+            pocket_dist_to_center = distance_to_center[seed_copy.mol.GetNumAtoms():]
             
-        #     total_atoms = seed_atoms + pocket_atoms
-        #     seed_soap = self.soap.create(total_atoms, centers=[center_pos], n_jobs=12)
+            assert len(seed_dist_to_center) == seed_copy.mol.GetNumAtoms()
+            assert len(pocket_dist_to_center) == pocket_copy.GetNumAtoms()
+            
+            seed_atoms = self.rdkit_to_ase(seed_copy.mol)
+            pocket_atoms = self.rdkit_to_ase(pocket_copy)
+            # if not self.embed_hydrogens:
+            #     try:
+            selected_seed_atom_idxs = [atom.index
+                                    for atom, distance in zip(seed_atoms, seed_dist_to_center) 
+                                    if (atom.symbol != 'H') and (distance < 10)]
+            seed_atoms = seed_atoms[selected_seed_atom_idxs]
+            selected_pocket_atom_idxs = [atom.index 
+                                        for atom, distance in zip(pocket_atoms, pocket_dist_to_center) 
+                                        if (atom.symbol != 'H') and (distance < 10)]
+            if len(selected_pocket_atom_idxs) > 0:
+                pocket_atoms = pocket_atoms[selected_pocket_atom_idxs]
+                total_atoms = seed_atoms + pocket_atoms
+            else:
+                total_atoms = seed_atoms
+                # except:
+                #     import pdb;pdb.set_trace()
+            
+            seed_soap = self.soap.create(total_atoms, centers=[center_pos])
 
-        #     seed_soap = normalize(seed_soap)
+            seed_soap = normalize(seed_soap)
 
-        #     return seed_soap.squeeze()
+            return seed_soap.squeeze()
         
-        # else:
+        else:
         
-        dummy_points = []
-        padding = 5
-        resolution = 2
-        for x1 in np.arange(center_pos[0] - padding, center_pos[0] + padding + 1, resolution):
-            for y1 in np.arange(center_pos[1] - padding, center_pos[1] + padding + 1, resolution):
-                for z1 in np.arange(center_pos[2] - padding, center_pos[2] + padding + 1, resolution):
-                    dummy_points.append([x1, y1, z1])
-                    
-        dummy_points = np.array(dummy_points)
-    
-        if not self.embed_hydrogens:
-            pocket_mol = Chem.RemoveHs(self.pocket_mol)
-        pocket_lig_mol = Chem.CombineMols(pocket_mol, self.seed.mol)
-        pocket_pos = pocket_lig_mol.GetConformer().GetPositions()
+            dummy_points = []
+            padding = 6
+            resolution = 2
+            for x1 in np.arange(center_pos[0] - padding, center_pos[0] + padding + 1, resolution):
+                for y1 in np.arange(center_pos[1] - padding, center_pos[1] + padding + 1, resolution):
+                    for z1 in np.arange(center_pos[2] - padding, center_pos[2] + padding + 1, resolution):
+                        dummy_points.append([x1, y1, z1])
+                        
+            dummy_points = np.array(dummy_points)
         
-        # not_focal = [True if i != (pocket_mol.GetNumAtoms() + self.focal_atom_id) else False for i in range(pocket_lig_mol.GetNumAtoms())]
-        # pocket_pos = pocket_pos[not_focal]
+            if not self.embed_hydrogens:
+                pocket_mol = Chem.RemoveHs(self.pocket_mol, sanitize=False)
+            pocket_lig_mol = Chem.CombineMols(pocket_mol, self.seed.mol)
+            pocket_pos = pocket_lig_mol.GetConformer().GetPositions()
+            
+            # not_focal = [True if i != (pocket_mol.GetNumAtoms() + self.focal_atom_id) else False for i in range(pocket_lig_mol.GetNumAtoms())]
+            # pocket_pos = pocket_pos[not_focal]
+            
+            distance_matrix = cdist(dummy_points, pocket_pos)
+            distance_to_focal = distance_matrix[:, pocket_mol.GetNumAtoms() + self.focal_atom_id]
+            neigh_id = get_neighbor_id_for_atom_id(mol=self.seed.mol, atom_id=self.focal_atom_id)
+            distance_to_neigh = distance_matrix[:, pocket_mol.GetNumAtoms() + neigh_id]
+            
+            distance_matrix_nonfocal = np.delete(distance_matrix, pocket_mol.GetNumAtoms() + self.focal_atom_id, axis=1)
+            min_distance = np.min(distance_matrix_nonfocal, axis=1)
+            
+            dummy_points = dummy_points[(min_distance > 2) 
+                                        & (distance_to_focal < padding) 
+                                        & (distance_to_focal < distance_to_neigh)]
+            dummy_x = [self.z_table.z_to_index(0)] * len(dummy_points)
+            dummy_focal = [0] * len(dummy_points)
+            dummy_pos = dummy_points.tolist()
         
-        distance_matrix = cdist(dummy_points, pocket_pos)
-        distance_to_focal = distance_matrix[:, pocket_mol.GetNumAtoms() + self.focal_atom_id]
-        neigh_id = get_neighbor_id_for_atom_id(mol=self.seed.mol, atom_id=self.focal_atom_id)
-        distance_to_neigh = distance_matrix[:, pocket_mol.GetNumAtoms() + neigh_id]
-        
-        distance_matrix_nonfocal = np.delete(distance_matrix, pocket_mol.GetNumAtoms() + self.focal_atom_id, axis=1)
-        min_distance = np.min(distance_matrix_nonfocal, axis=1)
-        
-        dummy_points = dummy_points[(min_distance > 2) & (distance_to_focal < 5) & (distance_to_focal < distance_to_neigh)]
-        dummy_x = [self.z_table.z_to_index(0)] * len(dummy_points)
-        dummy_focal = [0] * len(dummy_points)
-        dummy_pos = dummy_points.tolist()
-    
-        ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
+            ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
+                                                                        embed_hydrogens=self.embed_hydrogens,
+                                                                        center_pos=center_pos,
+                                                                        dummy_points=dummy_points)
+            protein_x, protein_pos, protein_focal = self.featurizer.get_mol_features(mol=self.pocket_mol,
                                                                     embed_hydrogens=self.embed_hydrogens,
                                                                     center_pos=center_pos,
                                                                     dummy_points=dummy_points)
-        protein_x, protein_pos, protein_focal = self.featurizer.get_mol_features(mol=self.pocket_mol,
-                                                                embed_hydrogens=self.embed_hydrogens,
-                                                                center_pos=center_pos,
-                                                                dummy_points=dummy_points)
-        
-        pocket_x = dummy_x + protein_x + ligand_x
-        pocket_pos = dummy_pos + protein_pos + ligand_pos
-        is_focal = dummy_focal + protein_focal + ligand_focal
-        
-        mol_id = [0] * len(dummy_x) + [1] * len(protein_x) + [2] * len(ligand_x)
-        
-        # with open('dummy.xyz', 'w') as f:
-        #     n_dummies = len(dummy_pos)
-        #     f.write(str(n_dummies) + '\n')
-        #     f.write('\n')
-        #     for pos in dummy_pos:
-        #         f.write(f'H {pos[0]} {pos[1]} {pos[2]}\n')
-        
-        # import pdb;pdb.set_trace()
-        
-        # x = torch.tensor(pocket_x, dtype=torch.float)
-        x = torch.tensor(pocket_x, dtype=torch.long)
-        pos = torch.tensor(pocket_pos, dtype=torch.float)
-        mol_id = torch.tensor(mol_id, dtype=torch.long)
-        # is_focal = torch.tensor(is_focal, dtype=torch.bool)
-        is_focal = torch.tensor(is_focal, dtype=torch.long)
-        
-        noise = torch.randn_like(pos) * 0.01
-        pos = pos + noise
-        
-        data = Data(x=x,
-                    pos=pos,
-                    mol_id=mol_id,
-                    is_focal=is_focal,
-                    )
+            
+            pocket_x = dummy_x + protein_x + ligand_x
+            pocket_pos = dummy_pos + protein_pos + ligand_pos
+            is_focal = dummy_focal + protein_focal + ligand_focal
+            
+            mol_id = [0] * len(dummy_x) + [1] * len(protein_x) + [2] * len(ligand_x)
+            
+            # with open('dummy.xyz', 'w') as f:
+            #     n_dummies = len(dummy_pos)
+            #     f.write(str(n_dummies) + '\n')
+            #     f.write('\n')
+            #     for pos in dummy_pos:
+            #         f.write(f'H {pos[0]} {pos[1]} {pos[2]}\n')
+            
+            # import pdb;pdb.set_trace()
+            
+            # x = torch.tensor(pocket_x, dtype=torch.float)
+            x = torch.tensor(pocket_x, dtype=torch.long)
+            pos = torch.tensor(pocket_pos, dtype=torch.float)
+            mol_id = torch.tensor(mol_id, dtype=torch.long)
+            # is_focal = torch.tensor(is_focal, dtype=torch.bool)
+            is_focal = torch.tensor(is_focal, dtype=torch.long)
+            
+            noise = torch.randn_like(pos) * 0.01
+            pos = pos + noise
+            
+            data = Data(x=x,
+                        pos=pos,
+                        mol_id=mol_id,
+                        is_focal=is_focal,
+                        )
 
-        return data
+            return data
     
     
     def set_focal_atom_id(self) -> bool:
@@ -408,7 +469,7 @@ class FragmentBuilderEnv():
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
-        if reward < -0.5:
+        if reward <= 0:
             self.terminated = True
         self.last_reward = reward
         
@@ -618,12 +679,15 @@ class BatchEnv():
     def __init__(self,
                  envs: list[FragmentBuilderEnv],
                  memory: Memory,
+                 best_scores: dict[int, float],
                  pocket_feature_type: str = 'soap',
                  scoring_function: str = SCORING_FUNCTION,
-                 embed_hydrogens: bool = EMBED_HYDROGENS) -> None:
+                 embed_hydrogens: bool = EMBED_HYDROGENS,
+                 ) -> None:
         self.envs = envs
         self.pocket_feature_type = pocket_feature_type
         self.memory = memory
+        self.best_scores = best_scores
         self.embed_hydrogens = embed_hydrogens
         self.vina_cli = VinaCLI()
         self.reader = PDBQTReader()
@@ -631,10 +695,10 @@ class BatchEnv():
         assert scoring_function in ['vina', 'glide', 'smina']
         self.scoring_function = scoring_function
         
-        species = ['C', 'N', 'O', 'Cl', 'S']
+        self.species = ['C', 'N', 'O', 'Cl', 'S']
         # if self.embed_hydrogens:
         #     species = ['H'] + species
-        self.soap = SOAP(species=species,
+        self.soap = SOAP(species=self.species,
                         r_cut=8,
                         n_max=8,
                         l_max=6)
@@ -715,6 +779,7 @@ class BatchEnv():
         tested_env_idxs: list[int] = []
         tested_states: dict[tuple[int], list[int]] = {}
         state_saves: dict[tuple[float], StateSave] = {}
+        # start_time = time.time()
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             
@@ -728,12 +793,12 @@ class BatchEnv():
                 tested_states[state].append(env_i)
             # if (not state in self.memory) and (state not in tested_states):
             else:
-                try:
-                    products, new_atom_idxs = env.action_to_products(frag_action)
-                except Exception as exception:
-                    print(str(exception))
-                    import pdb;pdb.set_trace()
-                    print(str(exception))
+                # try:
+                products, new_atom_idxs = env.action_to_products(frag_action)
+                # except Exception as exception:
+                #     print(str(exception))
+                #     import pdb;pdb.set_trace()
+                #     print(str(exception))
                 # products are unprotected
                 for product in products:
                     # Add carbon for mininplace
@@ -751,6 +816,8 @@ class BatchEnv():
                 tested_new_atom_idxs.extend(new_atom_idxs)
                 tested_env_idxs.extend([env_i] * len(products))
                 tested_states[state] = [env_i]
+            
+        # logging.info(f'Time to get products: {time.time() - start_time}')
             
         if len(tested_products) > 0:
             
@@ -875,7 +942,7 @@ class BatchEnv():
                         relative_score = score - seed_score
                         product = tested_products[test_i]
                         
-                        pose2product_matches = product.mol.GetSubstructMatches(pose, useChirality=True)
+                        pose2product_matches = product.mol.GetSubstructMatches(pose)
                         matches_rmsds = []
                         pose_copies = []
                         if len(pose2product_matches) > 1:
@@ -908,7 +975,10 @@ class BatchEnv():
                             matches_rmsds.append(rmsd)
                             pose_copies.append(pose_copy)
                             
-                        best_rmsd_i = np.argmin(matches_rmsds)
+                        try:
+                            best_rmsd_i = np.argmin(matches_rmsds)
+                        except:
+                            import pdb;pdb.set_trace()
                         pose_copy = pose_copies[best_rmsd_i]
                         rmsd = matches_rmsds[best_rmsd_i]
                         docked_poses[test_i] = pose_copy
@@ -916,7 +986,7 @@ class BatchEnv():
                                 
                         rmsds.append(rmsd)
                             
-                        reward = - relative_score - rmsd
+                        reward = - relative_score - rmsd / 2
                         rewards.append(reward)
                         
                     best_reward_i = np.argmax(rewards)
@@ -948,26 +1018,43 @@ class BatchEnv():
         
         assert len(state_saves) == len(self.ongoing_env_idxs)
         
+        # Refresh best scores
+        for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
+            env = self.envs[env_i]
+            seed_idx = self.seed_idxs[env_i]
+            state_save = state_saves[env_i]
+            best_score = self.best_scores[seed_idx]
+            if state_save.score < best_score:
+                logging.info(f'New best score: {state_save.score} better than {best_score} for seed {seed_idx}')
+                self.best_scores[seed_idx] = state_save.score
+        
         # Step with correct products
         rewards = []
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             state_save = state_saves[env_i]
+            seed_idx = self.seed_idxs[env_i]
             state = (seed_idx, *env.actions, frag_action)
             # if not state in self.memory:
             #     self.memory[state] = state_save
+                
+            best_score = self.best_scores[seed_idx]
             
             if np.isnan(state_save.score):
-                reward = -1
+                reward = 0
             else:
                 size_malus = 0
                 seed_nha = state_save.seed.mol.GetNumHeavyAtoms()
                 if seed_nha > 50:
-                    size_malus = seed_nha - 50
-                seed_score = env.current_score
-                to_scale = lambda score: (score - env.initial_score) / np.abs(env.native_score - env.initial_score)
-                relative_scaled_score = to_scale(state_save.score) - to_scale(seed_score)
-                reward = - min(relative_scaled_score, 1) - (size_malus / 10) # - state_save.rmsd
+                    # size_malus = seed_nha - 50
+                    reward = 0
+                else:
+                    seed_score = env.current_score
+                    # to_scale = lambda score: (score - env.initial_score) / best_score - env.initial_score
+                    # relative_scaled_score = to_scale(state_save.score) - to_scale(seed_score)
+                    # reward = max(relative_scaled_score, 0) # - state_save.rmsd
+                    relative_score = state_save.score - seed_score
+                    reward = max(-relative_score, 0)
             if np.isnan(reward):
                 import pdb;pdb.set_trace()
             rewards.append(reward)
@@ -1026,31 +1113,65 @@ class BatchEnv():
                 center_pos = np.array([center_pos.x, center_pos.y, center_pos.z])
                 
                 seed_copy = Fragment.from_fragment(env.seed)
-                seed_copy.protect()
-                pocket_copy = Mol(env.pocket_mol)
+                seed_copy.protect(protection_atomic_num=1)
+                # pocket_copy = Mol(env.pocket_mol)
                 
-                add_noise(seed_copy.mol.GetConformer())
-                add_noise(pocket_copy.GetConformer())
-                seed_atoms = env.rdkit_to_ase(seed_copy.mol)
-                pocket_atoms = env.rdkit_to_ase(pocket_copy)
-                if not self.embed_hydrogens:
-                    seed_atoms = seed_atoms[[atom.index 
-                                             for atom in seed_atoms 
-                                             if atom.symbol != 'H']]
-                    pocket_atoms = pocket_atoms[[atom.index 
-                                                 for atom in pocket_atoms 
-                                                 if atom.symbol != 'H']]
+                neigh_id = get_neighbor_id_for_atom_id(mol=seed_copy.mol, atom_id=env.focal_atom_id)
                 
-                total_atoms = seed_atoms + pocket_atoms
+                # add_noise(seed_copy.mol.GetConformer())
+                # add_noise(pocket_copy.GetConformer())
+                # distance_matrix = rdkit_distance_matrix(seed_copy.mol, env.pocket_mol)
+                # distance_to_center = distance_matrix[:, env.focal_atom_id]
+                
+                # distance_to_neigh = distance_matrix[:, neigh_id]
+                seed_positions = seed_copy.mol.GetConformer().GetPositions()
+                pocket_positions = env.pocket_mol.GetConformer().GetPositions()
+                all_positions = np.concatenate([seed_positions, pocket_positions])
+                neigh_position = seed_positions[neigh_id]
+                distance_matrix = cdist(all_positions, np.array([center_pos, neigh_position]))
+                distance_to_center = distance_matrix[:, 0]
+                distance_to_neigh = distance_matrix[:, 1]
+                
+                seed_dist_to_center = distance_to_center[:seed_copy.mol.GetNumAtoms()]
+                seed_dist_to_neigh = distance_to_neigh[:seed_copy.mol.GetNumAtoms()]
+                assert len(seed_dist_to_center) == seed_copy.mol.GetNumAtoms()
+                seed_symbols = [atom.GetSymbol() for atom in seed_copy.mol.GetAtoms()]
+                seed_positions = seed_copy.mol.GetConformer().GetPositions()
+                seed_positions = seed_positions + np.random.default_rng().normal(0, 0.01, seed_positions.shape)
+                seed_atoms = Atoms(symbols=seed_symbols, positions=seed_positions)
+                selected_seed_atom_idxs = [atom.index
+                                        for atom, distance_to_c, distance_to_n in zip(seed_atoms, seed_dist_to_center, seed_dist_to_neigh) 
+                                        if (atom.symbol in self.species) and (distance_to_c < 10) and (distance_to_c < distance_to_n)]
+                
+                pocket_dist_to_center = distance_to_center[seed_copy.mol.GetNumAtoms():]
+                pocket_dist_to_neigh = distance_to_neigh[seed_copy.mol.GetNumAtoms():]
+                assert len(pocket_dist_to_center) == env.pocket_mol.GetNumAtoms()
+                pocket_symbols = [atom.GetSymbol() for atom in env.pocket_mol.GetAtoms()]
+                pocket_positions = env.pocket_mol.GetConformer().GetPositions()
+                pocket_positions = pocket_positions + np.random.default_rng().normal(0, 0.01, pocket_positions.shape)
+                pocket_atoms = Atoms(symbols=pocket_symbols, positions=pocket_positions)
+                selected_pocket_atom_idxs = [atom.index 
+                                            for atom, distance_to_c, distance_to_n in zip(pocket_atoms, pocket_dist_to_center, pocket_dist_to_neigh) 
+                                            if (atom.symbol in self.species) and (distance_to_c < 10) and (distance_to_c < distance_to_n)]
+                
+                # total_atoms = seed_atoms[[env.focal_atom_id]]
+                # total_atoms = []
+                if len(selected_pocket_atom_idxs) == 0:
+                    total_atoms = Atoms(symbols=['C'], positions=[center_pos])
+                else:
+                    total_atoms = pocket_atoms[selected_pocket_atom_idxs]
+                    if len(selected_seed_atom_idxs) > 0:
+                        total_atoms += seed_atoms[selected_seed_atom_idxs]
+                
                 all_atoms.append(total_atoms)
                 center_pos_list.append([center_pos])
                 
-            # import pdb;pdb.set_trace()
-            obs_list = self.soap.create(all_atoms, centers=center_pos_list, n_jobs=8)
+            obs_list = self.soap.create(all_atoms, centers=center_pos_list, n_jobs=16)
             try:
                 obs_list = obs_list.squeeze(-2)
             except:
                 import pdb;pdb.set_trace()
+                
             # obs_list.append(obs)
                 
         else:

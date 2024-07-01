@@ -59,3 +59,4 @@ def add_noise(conformer: Conformer,
         initial_pos = conformer.GetAtomPosition(i)
         noisy_pos = initial_pos + noise_std * np.random.randn(3)
         conformer.SetAtomPosition(i, noisy_pos)
+        
