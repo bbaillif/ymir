@@ -374,6 +374,7 @@ class FragmentBuilderEnv():
             dummy_points = dummy_points[(min_distance > 2) 
                                         & (distance_to_focal < padding) 
                                         & (distance_to_focal < distance_to_neigh)]
+            dummy_points = np.append(dummy_points, [center_pos], axis=0)
             dummy_x = [self.z_table.z_to_index(0)] * len(dummy_points)
             dummy_focal = [0] * len(dummy_points)
             dummy_pos = dummy_points.tolist()
@@ -469,7 +470,7 @@ class FragmentBuilderEnv():
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
-        if reward <= 0:
+        if reward <= -1:
             self.terminated = True
         self.last_reward = reward
         
@@ -699,7 +700,7 @@ class BatchEnv():
         # if self.embed_hydrogens:
         #     species = ['H'] + species
         self.soap = SOAP(species=self.species,
-                        r_cut=8,
+                        r_cut=10,
                         n_max=8,
                         l_max=6)
         
@@ -772,6 +773,8 @@ class BatchEnv():
         frag_actions: list[int] = [int(frag_action) for frag_action in frag_actions]
         assert len(frag_actions) == len(self.ongoing_env_idxs)
 
+        initial_sizes = []
+
         # Determine action to score
         batch_truncated = []
         tested_products: list[Fragment] = []
@@ -783,6 +786,7 @@ class BatchEnv():
         for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
             env = self.envs[env_i]
             
+            initial_sizes.append(env.seed.mol.GetNumHeavyAtoms() - len(env.seed.protections))
             seed_idx = self.seed_idxs[env_i]
             state = (seed_idx, *env.actions, frag_action)
             # if state in self.memory:
@@ -922,6 +926,7 @@ class BatchEnv():
                     env = self.envs[env_i]
                     receptor_filepaths.append(env.complex.vina_protein.pdbqt_filepath)
                 smina_cli = SminaCLI(score_only=False)
+                # smina_cli = SminaCLI()
                 ligands = [product.mol for product in tested_products]
                 scores = smina_cli.get(receptor_paths=receptor_filepaths,
                                         ligands=ligands)
@@ -963,7 +968,7 @@ class BatchEnv():
                             other_atom_idxs = [i 
                                             for i in range(product.mol.GetNumAtoms()) 
                                             if i not in new_atom_idxs]
-                            pose_seed_positions = pose.GetConformer().GetPositions()[other_atom_idxs]
+                            pose_seed_positions = pose_copy.GetConformer().GetPositions()[other_atom_idxs]
                             product_seed_positions = product.mol.GetConformer().GetPositions()[other_atom_idxs]
                             deviation = pose_seed_positions - product_seed_positions
                             sd = np.square(deviation)
@@ -986,7 +991,10 @@ class BatchEnv():
                                 
                         rmsds.append(rmsd)
                             
-                        reward = - relative_score - rmsd / 2
+                        # if rmsd > 0.01:
+                        #     import pdb;pdb.set_trace()
+                            
+                        reward = - relative_score - rmsd
                         rewards.append(reward)
                         
                     best_reward_i = np.argmax(rewards)
@@ -1030,7 +1038,7 @@ class BatchEnv():
         
         # Step with correct products
         rewards = []
-        for env_i, frag_action in zip(self.ongoing_env_idxs, frag_actions):
+        for env_i, frag_action, initial_size in zip(self.ongoing_env_idxs, frag_actions, initial_sizes):
             env = self.envs[env_i]
             state_save = state_saves[env_i]
             seed_idx = self.seed_idxs[env_i]
@@ -1050,11 +1058,26 @@ class BatchEnv():
                     reward = 0
                 else:
                     seed_score = env.current_score
+                    new_size = seed_nha - initial_size
+                    if new_size == 0:
+                        import pdb;pdb.set_trace()
+                        
                     # to_scale = lambda score: (score - env.initial_score) / best_score - env.initial_score
                     # relative_scaled_score = to_scale(state_save.score) - to_scale(seed_score)
                     # reward = max(relative_scaled_score, 0) # - state_save.rmsd
+                    
+                    # relative_score = state_save.score - seed_score
+                    # ligand_efficiency = relative_score / np.sqrt(new_size)
+                    # reward = -ligand_efficiency
+                    
+                    # old_le = seed_score / np.sqrt(initial_size)
+                    # new_le = state_save.score / np.sqrt(seed_nha)
+                    # le_difference = new_le - old_le
+                    # reward = -le_difference
+                    
                     relative_score = state_save.score - seed_score
-                    reward = max(-relative_score, 0)
+                    reward = -relative_score - state_save.rmsd
+                    
             if np.isnan(reward):
                 import pdb;pdb.set_trace()
             rewards.append(reward)

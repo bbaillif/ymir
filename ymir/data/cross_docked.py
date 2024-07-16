@@ -46,7 +46,7 @@ class CrossDocked():
             ligands = self.compile_ligands()
             ligands = iter(ligands)
         else:
-            ligands = Chem.SDMolSupplier(self.ligands_path)
+            ligands = [ligand for ligand in Chem.SDMolSupplier(self.ligands_path)]
         return ligands
     
     

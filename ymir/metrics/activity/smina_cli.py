@@ -91,6 +91,7 @@ def run_smina(smina_command: SminaCommand) -> list[float]:
                 scores.append(score)
     except subprocess.TimeoutExpired:
         logging.info('Subprocess timeout')
+        
     return scores
 
 def fake_fn(smina_cmd: str) -> str:

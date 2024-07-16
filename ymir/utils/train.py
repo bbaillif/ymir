@@ -15,6 +15,7 @@ from ymir.env import BatchEnv
 from ymir.distribution import CategoricalMasked
 from torch.utils.tensorboard import SummaryWriter
 from ymir.molecule_builder import add_fragment_to_seed
+from ymir.metrics.activity.smina_cli import SminaCLI
 
 
 def get_frag_i(fragment: Fragment, 
@@ -213,6 +214,45 @@ def reinforce_episode(agent: Agent,
     else:
         real_data_idxs = []
     
+    assert len(set(seed_idxs)) == 1
+    seed = seeds[seed_idxs[0]]
+    seed_copy = Fragment.from_fragment(seed)
+    seed_copy.protect()
+    smina_cli = SminaCLI(score_only=False)
+    complx = complexes[seed2complex[seed_idxs[0]]]
+    scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath],
+                        ligands=[seed_copy.mol])
+    score = scores[0]
+    docked_poses = smina_cli.get_poses()
+    pose = docked_poses[0]
+    pose2product_matches = seed_copy.mol.GetSubstructMatches(pose)
+    assert len(pose2product_matches) == 1
+    pose2product = pose2product_matches[0]
+    if len(pose2product) != seed_copy.mol.GetNumAtoms():
+        import pdb;pdb.set_trace()
+    pose_copy = Mol(pose)
+    for pose_atom_id1, product_atom_id2 in enumerate(pose2product):
+        point3d = pose.GetConformer().GetAtomPosition(pose_atom_id1)
+        pose_copy.GetConformer().SetAtomPosition(product_atom_id2, point3d)
+        
+    pose_seed_positions = pose_copy.GetConformer().GetPositions()
+    product_seed_positions = seed_copy.mol.GetConformer().GetPositions()
+    deviation = pose_seed_positions - product_seed_positions
+    sd = np.square(deviation)
+    msd = np.mean(sd)
+    rmsd = np.sqrt(msd)
+    logging.info(f'RMSD initial: {rmsd}')
+    
+    seed_copy.mol.RemoveAllConformers()
+    seed_copy.mol.AddConformer(pose_copy.GetConformer())
+
+    seed_copy.unprotect()
+    
+    current_seeds = [Fragment.from_fragment(seed_copy) for _ in range(len(seed_idxs))]
+    current_initial_scores = [score for _ in range(len(seed_idxs))]
+    
+    # import pdb;pdb.set_trace()
+    
     next_info = batch_env.reset(current_complexes,
                                 current_seeds,
                                 current_initial_scores,
@@ -339,7 +379,8 @@ def reinforce_episode(agent: Agent,
     all_masks = torch.cat(ep_masks)
     all_actions = torch.cat(ep_actions)
     
-    all_returns = (all_returns - all_returns.mean()) / (all_returns.std() + 1e-5)
+    if len(all_returns) != 1:
+        all_returns = (all_returns - all_returns.mean()) / (all_returns.std() + 1e-5)
     
     logging.info(f'Returns: {all_returns}')
     
@@ -352,14 +393,14 @@ def reinforce_episode(agent: Agent,
     else:
         loss = policy_loss
         
-    is_fe = all_actions == 58
-    if is_fe.sum() > 0:  
-        all_probs = all_logprobs.exp()
-        fe_probs = all_probs[is_fe]
-        fe_entropies = normalized_entropies[is_fe]
-        high_prob_high_entropy = (fe_probs > 0.5) & (fe_entropies > 0.75)
-        if torch.any(high_prob_high_entropy):
-            import pdb;pdb.set_trace()
+    # is_fe = all_actions == 58
+    # if is_fe.sum() > 0:  
+    #     all_probs = all_logprobs.exp()
+    #     fe_probs = all_probs[is_fe]
+    #     fe_entropies = normalized_entropies[is_fe]
+    #     high_prob_high_entropy = (fe_probs > 0.5) & (fe_entropies > 0.75)
+    #     if torch.any(high_prob_high_entropy):
+    #         import pdb;pdb.set_trace()
     
     # if (episode_i + 1) % 500 == 0:
     #     import pdb;pdb.set_trace()
@@ -377,9 +418,10 @@ def reinforce_episode(agent: Agent,
     writer.add_scalar(f'params/ent_coef', ent_coef, episode_i)
     
     logging.info(f'Entropies: {all_entropies}')
-    logging.info(f'Nfrags: {n_possible_fragments}')
-    logging.info(f'log(Nfrags): {n_possible_fragments.log()}')
-    logging.info(f'Entropy losses: {entropy_loss}')
+    # logging.info(f'Nfrags: {n_possible_fragments}')
+    # logging.info(f'log(Nfrags): {n_possible_fragments.log()}')
+    if use_entropy_loss:
+        logging.info(f'Entropy losses: {entropy_loss}')
     
     return scores
     

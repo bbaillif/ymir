@@ -57,14 +57,14 @@ torch.backends.cudnn.deterministic = True
 # 1 episode = grow fragments + update NN
 n_episodes = 1_000_000
 # n_envs = 256 # we will have protein envs in parallel
-n_envs = 8
+n_envs = 128
 batch_size = n_envs
 n_max_steps = 10 # number of maximum fragment growing
 lr = 1e-5
 # lr = 1e-5
 gamma = 0.95 # discount factor for rewards
 device = torch.device('cuda')
-ent_coef = 0.5
+ent_coef = 1.0
 # ent_coef = 0.2
 # ent_patience = 10
 ent_patience = 5
@@ -80,7 +80,7 @@ use_entropy_loss = True
 rl_algorithm = 'reinforce'
 assert rl_algorithm in ['ppo', 'reinforce']
 
-pocket_feature_type = 'graph'
+pocket_feature_type = 'soap'
 assert pocket_feature_type in ['graph', 'soap']
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
@@ -218,17 +218,10 @@ for protein_path, pocket_path, ligand in tqdm(zip(protein_paths, pocket_paths, c
                                                 total=len(protein_paths)):
     current_seeds, complx, pocket = get_seeds_complx((protein_path, pocket_path, ligand))
     if len(current_seeds) > 0:
-        if any([seed.mol.GetNumAtoms() > 6 for seed in current_seeds]):
-            complexes.append(complx)
-        for current_seed in current_seeds:
-            if current_seed.mol.GetNumAtoms() > 6:
-                seeds.append(current_seed)
-                seed2complex.append(len(complexes) - 1)
-                generation_sequences.append(None)
-        # complexes.append(complx)
-        # seeds.extend(current_seeds)
-        # seed2complex.extend([len(complexes) - 1 for _ in current_seeds])
-        # generation_sequences.extend([None for _ in current_seeds])
+        complexes.append(complx)
+        seeds.extend(current_seeds)
+        seed2complex.extend([len(complexes) - 1 for _ in current_seeds])
+        generation_sequences.extend([None for _ in current_seeds])
            
     # training_data = {'seeds': seeds,
     #                     'seed2complex': seed2complex,
@@ -402,7 +395,6 @@ try:
         logging.debug(f'Episode i: {episode_i}')
         
         seed_i = (episode_i + 0) % n_seeds # + 40000 from the save
-        # seed_i = 1
         seed_idxs = [seed_i] * n_envs
         # seed_idxs = [idx % len(seeds) 
         #              for idx in range(episode_i * n_envs, (episode_i + 1) * n_envs)]

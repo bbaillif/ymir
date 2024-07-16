@@ -250,7 +250,7 @@ class FragmentLibrary():
                     unique_smiles.append(up_smiles)
                     unique_fragments.append(frag)
                     
-        fragments = unique_fragments
+            fragments = unique_fragments
             
         protected_fragments: dict[str, list] = {}
         for fragment in fragments:
