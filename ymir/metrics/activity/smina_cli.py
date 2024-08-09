@@ -119,8 +119,8 @@ class SminaCLI():
         self.verbosity = verbosity
         self.scoring_function = scoring_function
         self.base_smina_cmd = self.get_base_smina_cmd()
-        self.ligand_paths = []
-        self.pose_paths = []
+        self.ligand_paths = None
+        self.pose_paths = None
         
     def get(self,
             receptor_paths: list[str],
@@ -179,7 +179,7 @@ class SminaCLI():
         
         logging.info('Run Smina CLI')
         all_scores = []
-        if self.n_threads == 1:
+        if len(receptor_ligands) == 1 or self.n_threads == 1:
             for smina_command in smina_commands:
                 scores = run_smina(smina_command)
                 all_scores.extend(scores)
@@ -218,33 +218,33 @@ class SminaCLI():
            
         ligand_paths = []
             
-        if len(receptor_ligands) == 1 and len(receptor_ligands[list(receptor_ligands.keys())[0]]) >= self.n_threads:
-            ligands = receptor_ligands[list(receptor_ligands.keys())[0]]
-            batch_size = (len(ligands) // self.n_threads)
-            modulo = len(ligands) % self.n_threads
-            start = 0 
-            for i in range(self.n_threads):
-                if i < modulo:
-                    current_batch_size = batch_size + 1
-                else:
-                    current_batch_size = batch_size
-                end = start + current_batch_size
-                batch = ligands[start:end]
-                ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
-                with Chem.SDWriter(ligand_path) as writer:
-                    for ligand in batch:
-                        writer.write(ligand)
-                ligand_paths.append(ligand_path)
-                start = end
+        # if len(receptor_ligands) == 1 and len(receptor_ligands[list(receptor_ligands.keys())[0]]) >= self.n_threads:
+        #     ligands = receptor_ligands[list(receptor_ligands.keys())[0]]
+        #     batch_size = (len(ligands) // self.n_threads)
+        #     modulo = len(ligands) % self.n_threads
+        #     start = 0 
+        #     for i in range(self.n_threads):
+        #         if i < modulo:
+        #             current_batch_size = batch_size + 1
+        #         else:
+        #             current_batch_size = batch_size
+        #         end = start + current_batch_size
+        #         batch = ligands[start:end]
+        #         ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
+        #         with Chem.SDWriter(ligand_path) as writer:
+        #             for ligand in batch:
+        #                 writer.write(ligand)
+        #         ligand_paths.append(ligand_path)
+        #         start = end
             
-        else:
-            for i, receptor in enumerate(receptor_ligands):
-                ligands = receptor_ligands[receptor]
-                ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
-                with Chem.SDWriter(ligand_path) as writer:
-                    for ligand in ligands:
-                        writer.write(ligand)
-                ligand_paths.append(ligand_path)
+        # else:
+        for i, receptor in enumerate(receptor_ligands):
+            ligands = receptor_ligands[receptor]
+            ligand_path = os.path.join(self.ligands_directory, f'ligands_batch_{i}.sdf')
+            with Chem.SDWriter(ligand_path) as writer:
+                for ligand in ligands:
+                    writer.write(ligand)
+            ligand_paths.append(ligand_path)
         
         # import pdb;pdb.set_trace()
         

@@ -21,13 +21,13 @@ from ymir.params import (EMBED_HYDROGENS,
                          POCKET_RADIUS,
                          TORSION_ANGLES_DEG,
                          SCORING_FUNCTION,
-                         CROSSDOCKED_POCKET10_PATH)
+                         CROSSDOCKED_POCKET10_PATH,
+                         POCKET_FEATURE_TYPE)
 
 n_gen_molecules = 100
 batch_size = 25
 n_max_steps = 10
-pocket_feature_type = 'graph'
-n_fragments = 100
+pocket_feature_type = POCKET_FEATURE_TYPE
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 z_list = [0, 6, 7, 8, 16, 17]
@@ -51,9 +51,11 @@ fragment_library = FragmentLibrary(ligands=unique_ligands,
                                    removeHs=False,
                                    subset='cross_docked')
 
+n_fragments = 200
+# Remove fragment having at least one heavy atom not in list
 restricted_fragments = fragment_library.get_restricted_fragments(z_list, 
-                                                                max_attach=4, 
-                                                                max_torsions=2,
+                                                                max_attach=5, 
+                                                                max_torsions=5,
                                                                 n_fragments=n_fragments,
                                                                 get_unique=True
                                                                 )
@@ -195,9 +197,23 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(rotated_fragments=rotated_f
 memory = {}
 best_scores = {i: score for i, score in enumerate(initial_scores)}
 
+smina_dir = '/home/bb596/ymir/smina_test'
+if not os.path.exists(smina_dir):
+    os.mkdir(smina_dir)
+
+smina_ligands_dir = '/home/bb596/ymir/smina_test/ligands'
+if not os.path.exists(smina_ligands_dir):
+    os.mkdir(smina_ligands_dir)
+
+smina_output_dir = '/home/bb596/ymir/smina_test/poses'
+if not os.path.exists(smina_output_dir):
+    os.mkdir(smina_output_dir)
+
 batch_env = BatchEnv(envs,
                      memory,
                      best_scores,
+                     smina_ligands_dir=smina_ligands_dir,
+                     smina_output_directory=smina_output_dir,
                      pocket_feature_type=pocket_feature_type,
                      scoring_function=SCORING_FUNCTION,
                      )
@@ -207,11 +223,16 @@ agent = Agent(protected_fragments=protected_fragments,
               features_dim=batch_env.pocket_feature_dim,
               pocket_feature_type=pocket_feature_type,
               )
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_04_07_2024_14_36_06_step_240000_ent_1.0.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_17_07_2024_23_39_59_step_10000_ent_0.1.pt') # single
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_19_07_2024_22_20_26_step_5000_ent_0.1.pt') # multi
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_23_07_2024_20_17_26_step_4000_ent_0.1.pt') # le
+state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_25_07_2024_18_27_05_step_5000_ent_0.1.pt') # complex
+
 agent.load_state_dict(state_dict)
 agent = agent.to(device)
 
-gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd0/'
+# gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd_ppo_multi/'
+gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd_ppo_complex/'
 if not os.path.exists(gen_mols_dir):
     os.mkdir(gen_mols_dir)
     
@@ -290,100 +311,3 @@ for complx_i, complx in enumerate(tqdm(complexes)):
         for mol in generated_ligands:
             writer.write(mol)
     
-    
-
-
-# test_crossdocked = CrossDocked(subset='test')
-# ligand_filenames = test_crossdocked.get_ligand_filenames()
-# for ligand_filename in tqdm(ligand_filenames):
-#     target_dirname, real_ligand_filename = ligand_filename.split('/')
-#     native_ligand = test_crossdocked.get_native_ligand(ligand_filename)
-#     # native_ligand = Chem.AddHs(native_ligand, addCoords=True)
-            
-#     original_structure_path = test_crossdocked.get_original_structure_path(ligand_filename)
-#     pdb_id = real_ligand_filename[:4]
-#     complx = Complex(ligand=native_ligand,
-#                      protein_path=original_structure_path)
-#     fragments, frags_mol_atom_mapping = get_fragments_from_mol(native_ligand)
-    
-#     if len(fragments) > 1:
-    
-#         has_7 = [7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()] for fragment in fragments]
-        
-#         if not any(has_7):
-    
-#             initial_scores = []
-#             smina_cli = SminaCLI()
-#             ligands = [fragment.mol for fragment in fragments]
-#             initial_scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath for _ in ligands],
-#                                 ligands=ligands)
-            
-#             smina_cli = SminaCLI()
-#             scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath],
-#                                 ligands=[complx.ligand])
-#             native_score = scores[0]
-            
-#             generated_ligands = []
-#             for i in range(n_gen_molecules // batch_size):
-#                 # batch_idxs = range(i * batch_size, (i + 1) * batch_size)
-#                 seed_choice = np.random.choice(len(fragments), size=batch_size, replace=True)
-#                 current_seeds = [fragments[seed_idx] for seed_idx in seed_choice]
-#                 current_complexes = [complx for _ in range(batch_size)]
-#                 current_native_scores = [native_score for _ in range(batch_size)]
-#                 current_initial_scores = [initial_scores[seed_idx] for seed_idx in seed_choice]
-#                 current_generation_paths = [[] for _ in range(batch_size)]
-#                 real_data_idxs = []
-                
-#                 with torch.no_grad():
-#                     next_info = batch_env.reset(current_complexes,
-#                                             current_seeds,
-#                                             current_initial_scores,
-#                                             current_native_scores,
-#                                             seed_choice,
-#                                             real_data_idxs,
-#                                             current_generation_paths)
-#                     n_envs = batch_size
-#                     next_terminated = [False] * n_envs
-                    
-#                     step_i = 0
-#                     while step_i < n_max_steps and not all(next_terminated):
-                    
-#                         current_terminated = next_terminated
-#                         current_obs = batch_env.get_obs()
-                        
-#                         current_masks = batch_env.get_valid_action_mask()
-                        
-#                         batch = Batch.from_data_list(current_obs)
-#                         batch = batch.to(device)
-#                         features = agent.extract_features(batch)
-                        
-#                         # if current_masks.size()[0] != features.size()[0] :
-#                         #     import pdb;pdb.set_trace()
-                        
-#                         current_masks = current_masks.to(device)
-#                         if pocket_feature_type == 'soap':
-#                             b = None
-#                         else:
-#                             b = batch.batch
-#                             if features.shape[0] != b.shape[0]:
-#                                 import pdb;pdb.set_trace()
-#                         current_policy: CategoricalMasked = agent.get_policy(features,
-#                                                                                 batch=b,
-#                                                                                 masks=current_masks)
-#                         current_action: Action = agent.get_action(current_policy)
-#                         current_frag_actions = current_action.frag_i.cpu()  
-                        
-#                         t = batch_env.step(frag_actions=current_frag_actions)
-                        
-#                         step_rewards, next_terminated, next_truncated = t
-                        
-#                         step_i += 1
-                    
-#                 generated_ligands.extend([env.seed.mol for env in batch_env.envs])
-                
-#             # Save generated ligands
-#             with Chem.SDWriter(f'/home/bb596/hdd/ymir/generated_cross_docked_late/{real_ligand_filename}_generated.sdf') as writer:
-#                 for mol in generated_ligands:
-#                     writer.write(mol)
-            
-    # import pdb;pdb.set_trace()

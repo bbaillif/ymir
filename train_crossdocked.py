@@ -30,7 +30,9 @@ from ymir.params import (EMBED_HYDROGENS,
                          POCKET_RADIUS,
                          TORSION_ANGLES_DEG,
                          SCORING_FUNCTION,
-                         CROSSDOCKED_POCKET10_PATH)
+                         CROSSDOCKED_POCKET10_PATH,
+                         SMINA_LIGANDS_DIRECTORY,
+                         SMINA_OUTPUT_DIRECTORY)
 from ymir.utils.fragment import get_fragments_from_mol
 from ymir.utils.train import get_paths, ppo_episode, reinforce_episode
 from ymir.data.structure import GlideProtein, Complex
@@ -57,17 +59,18 @@ torch.backends.cudnn.deterministic = True
 # 1 episode = grow fragments + update NN
 n_episodes = 1_000_000
 # n_envs = 256 # we will have protein envs in parallel
-n_envs = 8
+n_envs = 32
 batch_size = n_envs
 n_max_steps = 10 # number of maximum fragment growing
-lr = 1e-5
+lr = 1e-4
 # lr = 1e-5
 gamma = 0.95 # discount factor for rewards
 device = torch.device('cuda')
-ent_coef = 0.5
+ent_coef = 0.1
 # ent_coef = 0.2
 # ent_patience = 10
 ent_patience = 5
+ent_decrease = False
 ent_coef_step = ent_coef / 20
 gae_lambda = 0.95
 clip_coef = 0.5
@@ -77,7 +80,7 @@ max_grad_value = 0.5
 
 use_entropy_loss = True
 
-rl_algorithm = 'reinforce'
+rl_algorithm = 'ppo'
 assert rl_algorithm in ['ppo', 'reinforce']
 
 pocket_feature_type = 'graph'
@@ -115,13 +118,13 @@ ligands = fragment_library.get_restricted_ligands(z_list)
 if SCORING_FUNCTION == 'glide':
     ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
 
-n_fragments = 100
+n_fragments = 200
 # Remove fragment having at least one heavy atom not in list
 restricted_fragments = fragment_library.get_restricted_fragments(z_list, 
-                                                                max_attach=3, 
-                                                                max_torsions=1,
+                                                                max_attach=5, 
+                                                                max_torsions=5,
                                                                 n_fragments=n_fragments,
-                                                                get_unique=False
+                                                                get_unique=True
                                                                 )
     
 synthon_smiles: list[str] = []
@@ -371,6 +374,8 @@ best_scores = {i: score for i, score in enumerate(initial_scores)}
 batch_env = BatchEnv(envs,
                      memory,
                      best_scores,
+                     smina_ligands_dir=SMINA_LIGANDS_DIRECTORY,
+                     smina_output_directory=SMINA_OUTPUT_DIRECTORY,
                      pocket_feature_type=pocket_feature_type,
                      scoring_function=SCORING_FUNCTION,
                      )
@@ -401,38 +406,40 @@ try:
         
         logging.debug(f'Episode i: {episode_i}')
         
-        seed_i = (episode_i + 0) % n_seeds # + 40000 from the save
-        # seed_i = 1
-        seed_idxs = [seed_i] * n_envs
-        # seed_idxs = [idx % len(seeds) 
-        #              for idx in range(episode_i * n_envs, (episode_i + 1) * n_envs)]
+        # seed_i = (episode_i + 0) % n_seeds # + 40000 from the save
+        # seed_idxs = [seed_i] * n_envs
+        seed_idxs = [idx % len(seeds) 
+                     for idx in range(episode_i * n_envs, (episode_i + 1) * n_envs)]
             
         if (0 in seed_idxs) and n_real_data > 0:
             n_real_data -= 1
             
         if rl_algorithm == 'ppo':
             ppo_episode(agent,
-                    episode_i,
-                    seed_idxs, 
-                    seeds,
-                    complexes,
-                    initial_scores,
-                    generation_sequences,
-                    batch_env,
-                    n_max_steps,
-                    n_real_data,
-                    device,
-                    gamma,
-                    gae_lambda,
-                    n_epochs,
-                    writer,
-                    optimizer,
-                    max_grad_value,
-                    vf_coef,
-                    ent_coef,
-                    batch_size,
-                    clip_coef,
-                    use_entropy_loss)
+                        episode_i,
+                        seed_idxs, 
+                        seeds,
+                        seed2complex,
+                        complexes,
+                        initial_scores,
+                        native_scores,
+                        generation_sequences,
+                        batch_env,
+                        n_max_steps,
+                        n_real_data,
+                        device,
+                        gamma,
+                        writer,
+                        optimizer,
+                        ent_coef,
+                        use_entropy_loss,
+                        pocket_feature_type,
+                        gae_lambda,
+                        n_epochs,
+                        max_grad_value,
+                        vf_coef,
+                        batch_size,
+                        clip_coef)
             
         else:
             scores = reinforce_episode(agent,
@@ -455,23 +462,23 @@ try:
                             use_entropy_loss,
                             pocket_feature_type)
             
-        current_scores.extend(scores)
-        assert len(current_scores) <= len(seeds)
-        if len(current_scores) == len(seeds):
-            mean_score = np.mean(current_scores)
+        # current_scores.extend(scores)
+        # assert len(current_scores) <= len(seeds)
+        # if len(current_scores) == len(seeds):
+        #     mean_score = np.mean(current_scores)
         
-            if mean_score < best_mean_score:
-                best_mean_score = mean_score
-                logging.info(f'New best mean score: {best_mean_score}, after {iteration_since_best} steps')
-                iteration_since_best = 0
-            else:
-                iteration_since_best += 1
-                if iteration_since_best > ent_patience:
-                    logging.info(f'Decreasing entropy coefficient from {ent_coef} to {max(0.00, ent_coef - ent_coef_step)} after {iteration_since_best} steps without improvement')
-                    ent_coef = max(0.00, ent_coef - ent_coef_step)
-                    iteration_since_best = 0
+        #     if mean_score < best_mean_score:
+        #         best_mean_score = mean_score
+        #         logging.info(f'New best mean score: {best_mean_score}, after {iteration_since_best} steps')
+        #         iteration_since_best = 0
+        #     else:
+        #         iteration_since_best += 1
+        #         if ent_decrease and iteration_since_best > ent_patience:
+        #             logging.info(f'Decreasing entropy coefficient from {ent_coef} to {max(0.00, ent_coef - ent_coef_step)} after {iteration_since_best} steps without improvement')
+        #             ent_coef = max(0.00, ent_coef - ent_coef_step)
+        #             iteration_since_best = 0
             
-            current_scores = []
+        #     current_scores = []
         
         # Save memory every memory_save_step
         # memory_size = len(memory)
@@ -482,7 +489,7 @@ try:
         #     memory_i = current_memory_i
         # logging.info(f'Memory size: {memory_size}')
         
-        if ((episode_i + 1) % 5000 == 0):
+        if ((episode_i + 1) % 1000 == 0):
             if use_entropy_loss:
                 save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_step_{(episode_i + 1)}_ent_{ent_coef}.pt'
                 # ent_coef = max(0.00, ent_coef - ent_coef_step)

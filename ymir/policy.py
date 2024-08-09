@@ -14,10 +14,11 @@ from ymir.params import (EMBED_HYDROGENS,
 from ymir.atomic_num_table import AtomicNumberTable
 from ymir.data.fragment import Fragment
 from torch_geometric.data import Batch
-from ymir.model import CNN, ComENetModel
+from ymir.model import CNN, ComENetModel, EGNN
 from torch_scatter import scatter
 from ymir.featurizer_sn import Featurizer
 from torch_geometric.data import Data
+from torch_cluster import radius_graph
     
 class Action(NamedTuple): 
     frag_i: torch.Tensor # (batch_size)
@@ -96,6 +97,7 @@ class Agent(nn.Module):
                  embed_hydrogens: bool = EMBED_HYDROGENS,
                  torsion_angle_deg: list[float] = TORSION_ANGLES_DEG,
                  pocket_feature_type: str = 'soap',
+                 nn_type: str = 'egnn'
                  ):
         super(Agent, self).__init__()
         self.protected_fragments = protected_fragments
@@ -108,6 +110,7 @@ class Agent(nn.Module):
         self.embed_hydrogens = embed_hydrogens
         self.torsion_angles_deg = torsion_angle_deg
         self.pocket_feature_type = pocket_feature_type
+        self.nn_type = nn_type
         
         self.n_fragments = len(self.protected_fragments)
         self.action_dim = self.n_fragments
@@ -123,20 +126,38 @@ class Agent(nn.Module):
             self.pocket_feature_extractor = MultiLinear(self.features_dim, 
                                                         [self.features_dim, self.features_dim // 2], 
                                                         n_hidden_features)
-        else:
-            # self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
-            #                                             features_dim=n_hidden_features)
-            self.pocket_irreps = o3.Irreps(f'{n_hidden_features}x0e')
-            self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'64x0e + 16x1o + 16x2e'),
-                                                irreps_output=self.pocket_irreps,
-                                                num_elements=len(self.z_table))
+        else: # 'graph'
+            if nn_type == 'cnn':
+                # self.pocket_feature_extractor = ComENetModel(config=COMENET_CONFIG,
+                #                                             features_dim=n_hidden_features)
+                self.pocket_irreps = o3.Irreps(f'{n_hidden_features}x0e')
+                self.pocket_feature_extractor = CNN(hidden_irreps=o3.Irreps(f'64x0e + 16x1o + 16x2e'),
+                                                    irreps_output=self.pocket_irreps,
+                                                    num_elements=len(self.z_table))
+            else:
+                self.pocket_feature_extractor = EGNN(in_node_nf=64,
+                                                        hidden_nf=64,
+                                                        out_node_nf=n_hidden_features,
+                                                        n_layers=3)
         
         # self.pocket_feature_extractor = MultiLinear(self.features_dim, [256, 128], n_hidden_features)
         
         self.actor = nn.Linear(n_hidden_features, self.n_fragments)
-        # self.critic = nn.Linear(n_hidden_features, 1)
+        self.critic = nn.Linear(n_hidden_features, 1)
         # self.actor = MultiLinear(n_hidden_features, [128, 64], self.n_fragments)
         # self.critic = MultiLinear(n_hidden_features, [128, 64], 1)
+        
+        self.num_elements = len(self.z_table)
+        self.node_mol_embedding_size = 8
+        self.focal_embedding_size = 16
+        self.node_z_embedding_size = 64 - self.node_mol_embedding_size - self.focal_embedding_size
+        
+        self.node_z_embedder = torch.nn.Embedding(num_embeddings=self.num_elements, 
+                                                  embedding_dim=self.node_z_embedding_size)
+        self.node_mol_embedder = torch.nn.Embedding(num_embeddings=3, # seed, pocket or void
+                                                    embedding_dim=self.node_mol_embedding_size)
+        self.focal_embedder = torch.nn.Embedding(num_embeddings=2, # focal or not
+                                                embedding_dim=self.focal_embedding_size)
 
 
     def forward(self, 
@@ -152,9 +173,34 @@ class Agent(nn.Module):
                          x: Batch):
         if self.pocket_feature_type == 'soap':
             features = self.pocket_feature_extractor(x)
-        else:
+        elif self.pocket_feature_type == 'graph':
             # features = self.pocket_feature_extractor(x)
-            features = self.pocket_feature_extractor.get_atomic_contributions(x)
+            if self.nn_type == 'cnn':
+                features = self.pocket_feature_extractor.get_atomic_contributions(x)
+            else:
+                batch = x
+                x = batch.x
+                pos = batch.pos
+                mol_id = batch.mol_id
+                is_focal = batch.is_focal
+                
+                x = self.node_z_embedder(x)
+                mol_id = self.node_mol_embedder(mol_id)
+                is_focal = self.focal_embedder(is_focal)
+                
+                radius = 4
+            
+                edge_index = radius_graph(pos, 
+                                          radius,
+                                          batch=batch.batch)
+                
+                x = torch.cat([x, mol_id, is_focal], dim=-1)
+                
+                features, coords = self.pocket_feature_extractor(h=x, 
+                                                        x=pos, 
+                                                        edges=edge_index, 
+                                                        edge_attr=None)
+            
         return features
     
 
@@ -177,8 +223,13 @@ class Agent(nn.Module):
         else:
             logits = atom_logits
         
-        # logits = torch.clamp(logits, -1, 1)
-        # logits = torch.tanh(logits)
+        p = 0.05
+        n_m = masks.sum(dim=-1, keepdim=True)
+        # n = n_m // 10 # 10% of the fragments are probable
+        n = 10
+        max_abs_value = torch.log((1/p - n) * (1 / (n_m - n))) / -2
+        # max_abs_value = max_abs_value.broadcast_to(logits.shape)
+        # logits = torch.clamp(logits, -max_abs_value, max_abs_value)
         
         # logits = self.actor(features)
         logits = logits.squeeze(-1)
@@ -214,12 +265,24 @@ class Agent(nn.Module):
                   features: torch.Tensor,
                   batch: torch.Tensor,
                   ) -> torch.Tensor:
+        
         atom_values = self.critic(features)
         
-        value = scatter(atom_values,
-                        batch,
-                        dim=0,
-                        reduce='mean')
+        if self.pocket_feature_type == 'graph':
+            try:
+                value = scatter(atom_values,
+                                batch,
+                                dim=0,
+                                reduce='mean')
+            except:
+                import pdb;pdb.set_trace()
+        else:
+            logits = atom_values
+        
+        # value = scatter(atom_values,
+        #                 batch,
+        #                 dim=0,
+        #                 reduce='mean')
         
         # value = self.critic(features)
         

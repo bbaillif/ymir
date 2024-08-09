@@ -81,7 +81,9 @@ ligand_filenames_subset = [ligand_filename.strip() for ligand_filename in lines]
 #                            ]
 
 models: list[SBModel] = [
-                        Ymir(minimized_path=config['data']['minimized_path']),
+                        # Ymir(minimized_path=config['data']['minimized_path'],
+                        #      gen_path='/home/bb596/hdd/ymir/generated_mols_cd_ppo_complex/',
+                        #      name='YmirComplex'),
                         YmirRandom(minimized_path=config['data']['minimized_path'])
                         ]
 
@@ -189,7 +191,8 @@ try:
                             if minimize:
                                 gen_mols = model.get_minimized_molecules(ligand_filename,
                                                                         gen_mols_h,
-                                                                        complex_minimizer)
+                                                                        complex_minimizer,
+                                                                        overwrite=True)
                             else:
                                 gen_mols = gen_mols_h
                     

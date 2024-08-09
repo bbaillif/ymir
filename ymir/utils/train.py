@@ -415,7 +415,7 @@ def reinforce_episode(agent: Agent,
     writer.add_scalar("train/entropy", all_entropies.mean().item(), episode_i)
     writer.add_scalar("train/loss", loss.item(), episode_i)
     writer.add_scalar(f"train/mean_reward", returns[0].mean().item(), episode_i)
-    writer.add_scalar(f'params/ent_coef', ent_coef, episode_i)
+    # writer.add_scalar(f'params/ent_coef', ent_coef, episode_i)
     
     logging.info(f'Entropies: {all_entropies}')
     # logging.info(f'Nfrags: {n_possible_fragments}')
@@ -430,40 +430,102 @@ def ppo_episode(agent: Agent,
             episode_i: int,
             seed_idxs: list[int], 
             seeds: list[Fragment],
+            seed2complex: list[int],
             complexes: list[Complex],
             initial_scores: list[float],
+            native_scores: list[float],
             generation_sequences: list[list[tuple[tuple[float], int]]],
             batch_env: BatchEnv,
             n_max_steps: int,
             n_real_data: int,
             device: torch.device,
             gamma: float,
-            gae_lambda: float,
-            n_epochs: int,
             writer: SummaryWriter,
             optimizer: torch.optim.Optimizer,
+            ent_coef,
+            use_entropy_loss,
+            pocket_feature_type,
+            gae_lambda: float,
+            n_epochs: int,
             max_grad_value,
             vf_coef,
-            ent_coef,
             batch_size,
             clip_coef,
-            use_entropy_loss,
             ):
     
-    # try:
-    current_seeds = [seeds[seed_i] for seed_i in seed_idxs]
-    current_complexes = [complexes[seed_i] for seed_i in seed_idxs]
-    current_initial_scores = [initial_scores[seed_i] for seed_i in seed_idxs]
+    current_seeds = []
+    current_complexes = []
+    current_initial_scores = []
+    current_native_scores = []
+    current_generation_paths = []
+    for seed_i in seed_idxs:
+        current_seeds.append(seeds[seed_i])
+        current_complexes.append(complexes[seed2complex[seed_i]])
+        current_initial_scores.append(initial_scores[seed_i])
+        current_native_scores.append(native_scores[seed_i])
+        current_generation_paths.append(generation_sequences[seed_i])
     
     if n_real_data > 0:
         real_data_idxs = np.random.choice(range(len(seed_idxs)), n_real_data, replace=False)
     else:
         real_data_idxs = []
-    current_generation_paths = [generation_sequences[seed_i] for seed_i in seed_idxs]
+    
+    # assert len(set(seed_idxs)) == 1
+    # seed = seeds[seed_idxs[0]]
+    seed_copies = []
+    for seed in current_seeds:
+        seed_copy = Fragment.from_fragment(seed)
+        seed_copy.protect()
+        seed_copies.append(seed_copy)
+    # seed_copy = Fragment.from_fragment(seed)
+    # seed_copy.protect()
+    # smina_cli = SminaCLI(score_only=False)
+    # complx = complexes[seed2complex[seed_idxs[0]]]
+    smina_cli = batch_env.smina_cli
+    receptor_paths = [complx.vina_protein.pdbqt_filepath for complx in current_complexes]
+    ligands = [seed_copy.mol for seed_copy in seed_copies]
+    scores = smina_cli.get(receptor_paths=receptor_paths,
+                        ligands=ligands)
+    # score = scores[0]
+    docked_poses = smina_cli.get_poses()
+    
+    current_seeds = []
+    for pose, seed_copy in zip(docked_poses, seed_copies):
+    
+        # pose = docked_poses[0]
+        pose2product_matches = seed_copy.mol.GetSubstructMatches(pose)
+        assert len(pose2product_matches) == 1
+        pose2product = pose2product_matches[0]
+        if len(pose2product) != seed_copy.mol.GetNumAtoms():
+            import pdb;pdb.set_trace()
+        pose_copy = Mol(pose)
+        for pose_atom_id1, product_atom_id2 in enumerate(pose2product):
+            point3d = pose.GetConformer().GetAtomPosition(pose_atom_id1)
+            pose_copy.GetConformer().SetAtomPosition(product_atom_id2, point3d)
+            
+        pose_seed_positions = pose_copy.GetConformer().GetPositions()
+        product_seed_positions = seed_copy.mol.GetConformer().GetPositions()
+        deviation = pose_seed_positions - product_seed_positions
+        sd = np.square(deviation)
+        msd = np.mean(sd)
+        rmsd = np.sqrt(msd)
+        logging.info(f'RMSD initial: {rmsd}')
+        
+        seed_copy.mol.RemoveAllConformers()
+        seed_copy.mol.AddConformer(pose_copy.GetConformer())
+
+        seed_copy.unprotect()
+        current_seeds.append(Fragment.from_fragment(seed_copy))
+    
+    # current_seeds = [Fragment.from_fragment(seed_copy) for _ in range(len(seed_idxs))]
+    current_initial_scores = scores
+    
+    # import pdb;pdb.set_trace()
     
     next_info = batch_env.reset(current_complexes,
                                 current_seeds,
                                 current_initial_scores,
+                                current_native_scores,
                                 seed_idxs,
                                 real_data_idxs,
                                 current_generation_paths)
@@ -490,10 +552,17 @@ def ppo_episode(agent: Agent,
             current_masks = batch_env.get_valid_action_mask()
             ep_masks.append(current_masks)
             
-            batch = Batch.from_data_list(current_obs)
-            batch = batch.to(device)
+            if pocket_feature_type == 'soap':
+                # input = torch.stack([torch.tensor(obs, dtype=torch.float) for obs in current_obs])
+                input = torch.tensor(current_obs, dtype=torch.float)
+                input = input.reshape(-1, batch_env.pocket_feature_dim)
+                input = input.to(device)
+                features = agent.extract_features(input)
             
-            features = agent.extract_features(batch)
+            else:
+                batch = Batch.from_data_list(current_obs)
+                batch = batch.to(device)
+                features = agent.extract_features(batch)
             
             # input = torch.stack([torch.tensor(obs, dtype=torch.float) for obs in current_obs])
             # input = input.to(device)
@@ -533,8 +602,8 @@ def ppo_episode(agent: Agent,
             
             t = batch_env.step(frag_actions=current_frag_actions)
             
-            logging.info(current_frag_actions)
-            logging.info(current_frag_logprobs.exp())
+            logging.info(f'Actions: {current_frag_actions}')
+            logging.info(f'Probs: {current_frag_logprobs.exp()}')
             
             step_rewards, next_terminated, next_truncated = t
             
@@ -633,7 +702,7 @@ def ppo_episode(agent: Agent,
         b_values = torch.cat(ep_values)
         b_masks = torch.cat(ep_masks)
         
-        logging.info(b_returns.squeeze())
+        logging.info(f'Returns: {b_returns.squeeze()}')
     
     training_loop(agent=agent,
                     b_obs=b_obs,
@@ -732,8 +801,8 @@ def training_loop(agent: Agent,
                 frag_pg_loss2 = -mb_advantages * torch.clamp(frag_ratio, 
                                                         min=1 - clip_coef, 
                                                         max=1 + clip_coef)
-                frag_pg_loss = torch.max(frag_pg_loss1, frag_pg_loss2).mean()
-                frag_entropy_loss = current_frag_entropy.mean()
+                frag_pg_loss = torch.max(frag_pg_loss1, frag_pg_loss2)
+                # frag_entropy_loss = current_frag_entropy
                 
                 mb_returns = b_returns[minibatch_inds]
                 mb_values = b_values[minibatch_inds]
@@ -748,17 +817,21 @@ def training_loop(agent: Agent,
                                                     clip_coef)
                 v_loss_clipped = (v_clipped - mb_returns) ** 2
                 v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = v_loss_max.mean()
+                v_loss = v_loss_max
                 
                 loss = frag_pg_loss + (v_loss * vf_coef) 
                 if torch.isnan(loss).any():
                     import pdb;pdb.set_trace()
                 if use_entropy_loss:
-                    loss = loss - (ent_coef * frag_entropy_loss)
+                    n_possible_fragments = current_masks.sum(dim=-1)
+                    normalized_entropies = current_frag_entropy / n_possible_fragments.log()
+                    entropy_loss = - normalized_entropies
+                    loss = loss + (ent_coef * entropy_loss)
                 
                 # if episode_i == 10 and epoch_i == 4:
                 #     import pdb;pdb.set_trace()
                 
+                loss = loss.mean()
                 optimizer.zero_grad()
                 loss.backward()
                 
@@ -778,9 +851,10 @@ def training_loop(agent: Agent,
                                         clip_value=max_grad_value)
                 optimizer.step()
                 
-    writer.add_scalar("train/value_loss", v_loss.item(), episode_i)
-    writer.add_scalar("train/policy_loss", frag_pg_loss.item(), episode_i)
-    writer.add_scalar("train/entropy", frag_entropy_loss.mean().item(), episode_i)
+    writer.add_scalar("train/value_loss", v_loss.mean().item(), episode_i)
+    writer.add_scalar("train/policy_loss", frag_pg_loss.mean().item(), episode_i)
+    writer.add_scalar("train/entropy", current_frag_entropy.mean().item(), episode_i)
     writer.add_scalar("train/approx_kl", frag_approx_kl.item(), episode_i)
     writer.add_scalar("train/loss", loss.item(), episode_i)
+    logging.info(f'Entropies: {current_frag_entropy}')
     # writer.add_scalar("train/mean_return", b_returns.mean(), episode_i)

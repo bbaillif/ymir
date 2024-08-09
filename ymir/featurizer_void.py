@@ -20,7 +20,7 @@ class Featurizer():
     
     def get_mol_features(self,
                          mol: Mol,
-                         dummy_points: np.ndarray,
+                         dummy_points: np.ndarray = None,
                         center_pos: tuple[float, float, float] = None,
                         embed_hydrogens: bool = False,
                         max_radius: float = POCKET_RADIUS,
@@ -35,23 +35,32 @@ class Featurizer():
         is_focal = []
         center_pos = np.array(center_pos)
         
-        if len(dummy_points) == 0:
-            dummy_points = np.array([center_pos])
-        
         is_heavy = np.array([atom.GetAtomicNum() > 1 for atom in mol.GetAtoms()])
         heavy_atom_ids = np.where(is_heavy)[0].tolist()
-        heavy_pos = mol_positions[is_heavy]
         
-        distance_matrix = cdist(heavy_pos, dummy_points)
-        min_distance = np.min(distance_matrix, axis=1)
-        embeded_heavy_atom_ids = np.argwhere(min_distance < neighbor_radius).flatten().tolist()
+        if dummy_points is not None:
+            if len(dummy_points) == 0:
+                dummy_points = np.array([center_pos])
+        
+            heavy_pos = mol_positions[is_heavy]
+            
+            distance_matrix = cdist(heavy_pos, dummy_points)
+            min_distance = np.min(distance_matrix, axis=1)
+            embeded_heavy_atom_ids = np.argwhere(min_distance < neighbor_radius).flatten().tolist()
+            
+            embeded_atom_ids = [heavy_atom_ids[heavy_atom_id] 
+                                for heavy_atom_id in embeded_heavy_atom_ids]
+            
+        else:
+            embeded_atom_ids = heavy_atom_ids
         
         # closest_atom_ids = np.argsort(distance_matrix, axis=1)
         # n_closest_per_atom = 3
         # embeded_heavy_atom_ids = set(closest_atom_ids[:, :n_closest_per_atom].flatten().tolist())
         
-        for heavy_atom_id in embeded_heavy_atom_ids:
-            atom_id = heavy_atom_ids[heavy_atom_id]
+        # for heavy_atom_id in embeded_heavy_atom_ids:
+        #     atom_id = heavy_atom_ids[heavy_atom_id]
+        for atom_id in embeded_atom_ids:
             atom = mol.GetAtomWithIdx(atom_id)
             atomic_num = atom.GetAtomicNum()
             # embed = atom_id != focal_id
@@ -69,7 +78,7 @@ class Featurizer():
 
     def get_fragment_features(self,
                               fragment: Fragment,
-                              dummy_points: np.ndarray,
+                              dummy_points: np.ndarray = None,
                             center_pos: tuple[float, float, float] = None,
                             embed_hydrogens: bool = False,
                             max_radius: float = POCKET_RADIUS,

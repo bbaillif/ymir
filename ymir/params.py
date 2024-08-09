@@ -172,11 +172,14 @@ if not os.path.exists(SMINA_OUTPUT_DIRECTORY):
 SMINA_MAPS_DIRECTORY = os.path.join(SMINA_DIRECTORY, 'maps')
 if not os.path.exists(SMINA_MAPS_DIRECTORY):
     os.mkdir(SMINA_MAPS_DIRECTORY)
-SMINA_CPUS = 1
+SMINA_CPUS = 12
 SMINA_SEED = SEED
 SMINA_CONFIG_PATH = os.path.join(SMINA_DIRECTORY, 'config.txt')
-SMINA_PATH = os.path.join(SMINA_DIRECTORY, 'smina.static')
+SMINA_PATH = '/home/bb596/ymir/smina.static'
 
 VINA_DATASET_PATH = '/home/bb596/hdd/ymir/vina_mini_dataset.p'
 
 SCORING_FUNCTION = 'smina'
+POCKET_FEATURE_TYPE = 'graph'
+N_MAX_STEPS = 10
+BATCH_SIZE = 64

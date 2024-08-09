@@ -28,7 +28,11 @@ from tqdm import tqdm
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from ymir.atomic_num_table import AtomicNumberTable
-from ymir.params import EMBED_HYDROGENS, SCORING_FUNCTION, TORSION_ANGLES_DEG
+from ymir.params import (EMBED_HYDROGENS, 
+                         SCORING_FUNCTION, 
+                         TORSION_ANGLES_DEG,
+                         SMINA_LIGANDS_DIRECTORY,
+                         SMINA_OUTPUT_DIRECTORY)
 from ymir.featurizer_void import Featurizer
 from ymir.metrics.activity import VinaScore
 from ymir.bond_distance import MedianBondDistance
@@ -153,7 +157,9 @@ class FragmentBuilderEnv():
         
         self.new_atom_idxs = range(self.seed.mol.GetNumAtoms())
         
-        
+        self.native_centroid = self.complex.ligand.GetConformer().GetPositions().mean(axis=0)
+        self.seed_centroid = self.seed.mol.GetConformer().GetPositions().mean(axis=0)
+        self.dtc = np.linalg.norm(self.native_centroid - self.seed_centroid)
         
         # return observation, info
         return info
@@ -388,11 +394,48 @@ class FragmentBuilderEnv():
                                                                     center_pos=center_pos,
                                                                     dummy_points=dummy_points)
             
+            print(len(dummy_x))
+            
             pocket_x = dummy_x + protein_x + ligand_x
             pocket_pos = dummy_pos + protein_pos + ligand_pos
             is_focal = dummy_focal + protein_focal + ligand_focal
             
             mol_id = [0] * len(dummy_x) + [1] * len(protein_x) + [2] * len(ligand_x)
+            
+            # ligand_x, ligand_pos, ligand_focal = self.featurizer.get_fragment_features(fragment=self.seed, 
+            #                                                             embed_hydrogens=self.embed_hydrogens,
+            #                                                             center_pos=center_pos,
+            #                                                             # dummy_points=dummy_points
+            #                                                             )
+            # protein_x, protein_pos, protein_focal = self.featurizer.get_mol_features(mol=self.pocket_mol,
+            #                                                         embed_hydrogens=self.embed_hydrogens,
+            #                                                         center_pos=center_pos,
+            #                                                         # dummy_points=dummy_points
+            #                                                         )
+            
+            # seed_copy = Fragment.from_fragment(self.seed)
+            # seed_copy.unprotect()
+            
+            # dummy_x = []
+            # dummy_pos = []
+            # dummy_focal = []
+            # for atom_id in seed_copy.get_attach_points():
+            #     atom = seed_copy.mol.GetAtomWithIdx(atom_id)
+            #     atomic_num = atom.GetAtomicNum()
+            #     idx = self.z_table.z_to_index(atomic_num)
+            #     dummy_x.append(idx)
+            #     atom_pos = seed_copy.mol.GetConformer().GetAtomPosition(atom_id)
+            #     dummy_pos.append([atom_pos.x, atom_pos.y, atom_pos.z])
+            #     if atom_id != self.focal_atom_id:
+            #         dummy_focal.append(0)
+            #     else:
+            #         dummy_focal.append(1)
+            
+            # pocket_x = dummy_x + protein_x + ligand_x
+            # pocket_pos = dummy_pos + protein_pos + ligand_pos
+            # is_focal = dummy_focal + protein_focal + ligand_focal
+            
+            # mol_id = [0] * len(dummy_x) + [1] * len(protein_x) + [2] * len(ligand_x)
             
             # with open('dummy.xyz', 'w') as f:
             #     n_dummies = len(dummy_pos)
@@ -470,8 +513,8 @@ class FragmentBuilderEnv():
         
         self.terminated = self.set_focal_atom_id() # seed is protected
         
-        if reward <= -1:
-            self.terminated = True
+        # if reward <= 0:
+        #     self.terminated = True
         self.last_reward = reward
         
         n_actions = len(self.actions)
@@ -483,6 +526,9 @@ class FragmentBuilderEnv():
         
         # if self.terminated or self.truncated:
         #     assert(all([atom.GetAtomicNum() > 0 for atom in self.seed.mol.GetAtoms()]))
+        
+        self.seed_centroid = self.seed.mol.GetConformer().GetPositions().mean(axis=0)
+        self.dtc = np.linalg.norm(self.native_centroid - self.seed_centroid)
         
         # return observation, reward, self.terminated, self.truncated, info
         return self.terminated, self.truncated, info
@@ -681,6 +727,8 @@ class BatchEnv():
                  envs: list[FragmentBuilderEnv],
                  memory: Memory,
                  best_scores: dict[int, float],
+                 smina_ligands_dir: str = SMINA_LIGANDS_DIRECTORY,
+                 smina_output_directory: str = SMINA_OUTPUT_DIRECTORY,
                  pocket_feature_type: str = 'soap',
                  scoring_function: str = SCORING_FUNCTION,
                  embed_hydrogens: bool = EMBED_HYDROGENS,
@@ -690,7 +738,9 @@ class BatchEnv():
         self.memory = memory
         self.best_scores = best_scores
         self.embed_hydrogens = embed_hydrogens
-        self.vina_cli = VinaCLI()
+        self.smina_cli = SminaCLI(ligands_directory=smina_ligands_dir,
+                                  output_directory=smina_output_directory,
+                                  score_only=False)
         self.reader = PDBQTReader()
         
         assert scoring_function in ['vina', 'glide', 'smina']
@@ -925,12 +975,10 @@ class BatchEnv():
                 for env_i in tested_env_idxs:
                     env = self.envs[env_i]
                     receptor_filepaths.append(env.complex.vina_protein.pdbqt_filepath)
-                smina_cli = SminaCLI(score_only=False)
-                # smina_cli = SminaCLI()
                 ligands = [product.mol for product in tested_products]
-                scores = smina_cli.get(receptor_paths=receptor_filepaths,
+                scores = self.smina_cli.get(receptor_paths=receptor_filepaths,
                                         ligands=ligands)
-                docked_poses = smina_cli.get_poses()
+                docked_poses = self.smina_cli.get_poses()
                 
                 for env_i in set(tested_env_idxs):
                     env = self.envs[env_i]
@@ -1051,32 +1099,36 @@ class BatchEnv():
             if np.isnan(state_save.score):
                 reward = 0
             else:
-                size_malus = 0
                 seed_nha = state_save.seed.mol.GetNumHeavyAtoms()
-                if seed_nha > 50:
-                    # size_malus = seed_nha - 50
-                    reward = 0
-                else:
-                    seed_score = env.current_score
-                    new_size = seed_nha - initial_size
-                    if new_size == 0:
-                        import pdb;pdb.set_trace()
-                        
-                    # to_scale = lambda score: (score - env.initial_score) / best_score - env.initial_score
-                    # relative_scaled_score = to_scale(state_save.score) - to_scale(seed_score)
-                    # reward = max(relative_scaled_score, 0) # - state_save.rmsd
+                size_malus = max(0, seed_nha - 40)
+                
+                # if seed_nha > 50:
+                #     size_malus = seed_nha - 50
+                #     reward = -1
+                # else:
+                
+                seed_score = env.current_score
+                # new_size = seed_nha - initial_size
                     
-                    # relative_score = state_save.score - seed_score
-                    # ligand_efficiency = relative_score / np.sqrt(new_size)
-                    # reward = -ligand_efficiency
-                    
-                    # old_le = seed_score / np.sqrt(initial_size)
-                    # new_le = state_save.score / np.sqrt(seed_nha)
-                    # le_difference = new_le - old_le
-                    # reward = -le_difference
-                    
-                    relative_score = state_save.score - seed_score
-                    reward = -relative_score - state_save.rmsd
+                # to_scale = lambda score: (score - env.initial_score) / best_score - env.initial_score
+                # relative_scaled_score = to_scale(state_save.score) - to_scale(seed_score)
+                # reward = max(relative_scaled_score, 0) # - state_save.rmsd
+                
+                # relative_score = state_save.score - seed_score
+                # ligand_efficiency = relative_score / np.sqrt(new_size)
+                # reward = -ligand_efficiency
+                
+                # old_le = seed_score / np.sqrt(initial_size)
+                # new_le = state_save.score / np.sqrt(seed_nha)
+                # le_difference = new_le - old_le
+                # reward = -le_difference
+                
+                new_centroid = state_save.seed.mol.GetConformer().GetPositions().mean(axis=0)
+                new_dtc = np.linalg.norm(env.native_centroid - new_centroid)
+                dtc_deviation = new_dtc - env.dtc
+                
+                relative_score = state_save.score - seed_score
+                reward = -relative_score - state_save.rmsd - dtc_deviation - size_malus
                     
             if np.isnan(reward):
                 import pdb;pdb.set_trace()
@@ -1205,15 +1257,20 @@ class BatchEnv():
         return obs_list
     
     
-    def save_state(self) -> None:
+    def save_state(self,
+                   save_dir = '/home/bb596/hdd/ymir/saved_states/',
+                   prefix = 'test') -> None:
         
-        ligand_path = 'ligands.sdf' 
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        
+        ligand_path = os.path.join(save_dir, f'{prefix}_ligands.sdf' )
         ligand_writer = Chem.SDWriter(ligand_path)
         
-        pocket_path = 'pockets.sdf'  
+        pocket_path = os.path.join(save_dir, f'{prefix}_pockets.sdf')
         pocket_writer = Chem.SDWriter(pocket_path)
         
-        native_ligand_path = 'native_ligands.sdf'
+        native_ligand_path = os.path.join(save_dir, f'{prefix}_native_ligands.sdf')
         native_writer = Chem.SDWriter(native_ligand_path)
         
         for env in self.envs:
