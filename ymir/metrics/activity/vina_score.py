@@ -56,7 +56,7 @@ class VinaScore():
                 all_scores.append(score)
             except Exception as e:
                 logging.warning(f'Vina scoring error: {e}')
-                all_scores.append(100)
+                all_scores.append(0)
             
         assert len(all_scores) == len(mols)
         

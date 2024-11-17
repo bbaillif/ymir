@@ -8,7 +8,7 @@ from torch_geometric.data import Data
 from rdkit.Chem import Mol
 from ymir.params import POCKET_RADIUS, NEIGHBOR_RADIUS
 from ymir.data import Fragment
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import pdist, squareform, cdist
 
 xyz_coordinate = list[float, float, float]
 
@@ -20,6 +20,7 @@ class Featurizer():
     
     def get_mol_features(self,
                          mol: Mol,
+                         dummy_points: np.ndarray = None,
                         center_pos: tuple[float, float, float] = None,
                         embed_hydrogens: bool = False,
                         max_radius: float = POCKET_RADIUS,
@@ -33,53 +34,51 @@ class Featurizer():
         pos = []
         is_focal = []
         center_pos = np.array(center_pos)
-        embeded_atom_ids = []
-        for atom_id, atom in enumerate(mol.GetAtoms()):
-            atomic_num = atom.GetAtomicNum()
-            atom_pos = mol_positions[atom_id]
-            distance_to_center = np.linalg.norm(center_pos - atom_pos)
-            embed = distance_to_center < max_radius
-            if atomic_num == 1 and (not embed_hydrogens):
-                embed = False
-            if embed and (atomic_num in self.z_table.zs):
-                embeded_atom_ids.append(atom_id)
-                
-        distance_matrix = pdist(mol_positions)
-        distance_matrix = squareform(distance_matrix)
-        all_included_ids = list(embeded_atom_ids)
+        
+        is_heavy = np.array([atom.GetAtomicNum() > 1 for atom in mol.GetAtoms()])
+        heavy_atom_ids = np.where(is_heavy)[0].tolist()
+        
+        if dummy_points is not None:
+            if len(dummy_points) == 0:
+                dummy_points = np.array([center_pos])
+        
+            heavy_pos = mol_positions[is_heavy]
+            
+            distance_matrix = cdist(heavy_pos, dummy_points)
+            min_distance = np.min(distance_matrix, axis=1)
+            embeded_heavy_atom_ids = np.argwhere(min_distance < neighbor_radius).flatten().tolist()
+            
+            embeded_atom_ids = [heavy_atom_ids[heavy_atom_id] 
+                                for heavy_atom_id in embeded_heavy_atom_ids]
+            
+        else:
+            embeded_atom_ids = heavy_atom_ids
+        
+        # closest_atom_ids = np.argsort(distance_matrix, axis=1)
+        # n_closest_per_atom = 3
+        # embeded_heavy_atom_ids = set(closest_atom_ids[:, :n_closest_per_atom].flatten().tolist())
+        
+        # for heavy_atom_id in embeded_heavy_atom_ids:
+        #     atom_id = heavy_atom_ids[heavy_atom_id]
         for atom_id in embeded_atom_ids:
-            dist_to_others = distance_matrix[atom_id]
-            within_radius_ids = np.argwhere(dist_to_others < neighbor_radius).flatten().tolist()
             atom = mol.GetAtomWithIdx(atom_id)
             atomic_num = atom.GetAtomicNum()
-            assert(any([mol.GetAtomWithIdx(neighbor_id).GetAtomicNum() in self.z_table.zs for neighbor_id in within_radius_ids]))
-            for neighbor_id in within_radius_ids:
-                atom = mol.GetAtomWithIdx(neighbor_id)
-                atomic_num = atom.GetAtomicNum()
-                if atomic_num == 1 and (not embed_hydrogens):
-                    embed = False
-                else:
-                    embed = True
-                if embed and (atomic_num in self.z_table.zs):
-                    all_included_ids.append(neighbor_id)
-                
-        included_ids = set(all_included_ids)
-        for atom_id in included_ids:
-            atom = mol.GetAtomWithIdx(atom_id)
-            atomic_num = atom.GetAtomicNum()
-            atom_pos = mol_positions[atom_id]
-            idx = self.z_table.z_to_index(atomic_num)
-            x.append(idx)
-            # one_hot = [0.0] * len(self.z_table)
-            # one_hot[idx] = 1.0
-            # x.append(one_hot)
-            pos.append(atom_pos.tolist())
-            is_focal.append(atom_id == focal_id)
+            # embed = atom_id != focal_id
+            embed = True
+            # if atomic_num == 1 and (not embed_hydrogens):
+            #     embed = False
+            if embed and (atomic_num in self.z_table.zs):
+                atom_pos = mol_positions[atom_id]
+                idx = self.z_table.z_to_index(atomic_num)
+                x.append(idx)
+                pos.append(atom_pos.tolist())
+                is_focal.append(atom_id == focal_id)
         
         return x, pos, is_focal
 
     def get_fragment_features(self,
                               fragment: Fragment,
+                              dummy_points: np.ndarray = None,
                             center_pos: tuple[float, float, float] = None,
                             embed_hydrogens: bool = False,
                             max_radius: float = POCKET_RADIUS,
@@ -93,6 +92,7 @@ class Featurizer():
         frag_copy.unprotect()
         mol = frag_copy.mol
         x, pos, is_focal = self.get_mol_features(mol=mol, 
+                                                 dummy_points=dummy_points,
                                                 center_pos=center_pos,
                                                 embed_hydrogens=embed_hydrogens,
                                                 max_radius=max_radius,

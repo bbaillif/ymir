@@ -29,12 +29,15 @@ from ymir.params import (EMBED_HYDROGENS,
                          SEED,
                          POCKET_RADIUS,
                          TORSION_ANGLES_DEG,
-                         SCORING_FUNCTION)
+                         SCORING_FUNCTION,
+                         CROSSDOCKED_POCKET10_PATH)
 from ymir.utils.fragment import get_fragments_from_mol
 from ymir.utils.train import get_paths, ppo_episode, reinforce_episode
 from ymir.data.structure import GlideProtein, Complex
 from ymir.metrics.activity.glide_score import GlideScore
 from ymir.metrics.activity.smina_cli import SminaCLI
+from ymir.data.cross_docked import CrossDocked
+from multiprocessing import Pool
 
 
 logging.basicConfig(filename='train.log', 
@@ -54,18 +57,17 @@ torch.backends.cudnn.deterministic = True
 # 1 episode = grow fragments + update NN
 n_episodes = 1_000_000
 # n_envs = 256 # we will have protein envs in parallel
-n_envs = 140
+n_envs = 128
 batch_size = n_envs
-n_max_steps = 5 # number of maximum fragment growing
-# lr = 5e-4
-# lr = 1e-4
-lr = 5e-6
+n_max_steps = 10 # number of maximum fragment growing
+lr = 1e-5
+# lr = 1e-5
 gamma = 0.95 # discount factor for rewards
 device = torch.device('cuda')
-ent_coef = 2.0
+ent_coef = 1.0
 # ent_coef = 0.2
 # ent_patience = 10
-ent_patience = 100
+ent_patience = 5
 ent_coef_step = ent_coef / 20
 gae_lambda = 0.95
 clip_coef = 0.5
@@ -73,19 +75,34 @@ n_epochs = 5
 vf_coef = 0.5
 max_grad_value = 0.5
 
+use_entropy_loss = True
+
 rl_algorithm = 'reinforce'
 assert rl_algorithm in ['ppo', 'reinforce']
 
-use_entropy_loss = True
 pocket_feature_type = 'soap'
 assert pocket_feature_type in ['graph', 'soap']
 
 timestamp = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
-experiment_name = f"ymir_v2_ppo_{timestamp}"
+experiment_name = f"ymir_{pocket_feature_type}_{timestamp}"
 
-writer = SummaryWriter(f"logs_reinforce_v2/{experiment_name}")
+writer = SummaryWriter(f"logs_final/{experiment_name}")
 
-fragment_library = FragmentLibrary(removeHs=False)
+cross_docked_train = CrossDocked()
+cd_ligands = cross_docked_train.get_ligands()
+cd_smiles = []
+unique_ligands = []
+cd_is = []
+for cd_i, ligand in enumerate(cd_ligands):
+    smiles = Chem.MolToSmiles(ligand)
+    if smiles not in cd_smiles:
+        cd_smiles.append(smiles)
+        unique_ligands.append(ligand)
+        cd_is.append(cd_i)
+
+fragment_library = FragmentLibrary(ligands=unique_ligands,
+                                   removeHs=False,
+                                   subset='cross_docked')
 
 z_list = [0, 6, 7, 8, 16, 17]
 if EMBED_HYDROGENS:
@@ -98,13 +115,13 @@ ligands = fragment_library.get_restricted_ligands(z_list)
 if SCORING_FUNCTION == 'glide':
     ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
 
-n_fragments = 200
+n_fragments = 100
 # Remove fragment having at least one heavy atom not in list
 restricted_fragments = fragment_library.get_restricted_fragments(z_list, 
-                                                                max_attach=4, 
-                                                                max_torsions=2,
+                                                                max_attach=3, 
+                                                                max_torsions=1,
                                                                 n_fragments=n_fragments,
-                                                                get_unique=True
+                                                                get_unique=False
                                                                 )
     
 synthon_smiles: list[str] = []
@@ -138,132 +155,187 @@ if len(set(synthon_smiles)) != len(synthon_smiles):
 
 pocket_radius = POCKET_RADIUS
 
-lp_pdbbind = pd.read_csv('LP_PDBBind.csv')
-lp_pdbbind = lp_pdbbind.rename({'Unnamed: 0' : 'PDB_ID'}, axis=1)
+cd_split = cross_docked_train.get_split()
 
-protein_paths = []
-for ligand in ligands:
-    pdb_id = ligand.GetProp('PDB_ID')
-    protein_path, _ = fragment_library.pdbbind.get_pdb_id_pathes(pdb_id)
-    protein_paths.append(protein_path)
-
-glide_not_working = ['1px4', '2hjb', '3c2r', '3pcg', '3pce', '3pcn', '4bps']
-
-lp_pdbbind_subsets = {pdb_id: subset 
-                      for pdb_id, subset in zip(lp_pdbbind['PDB_ID'], lp_pdbbind['new_split'])}
+def get_seeds_complx(params) -> tuple[list[Fragment], Complex]:
+    protein_path, pocket_path, ligand = params
+    fragments, frags_mol_atom_mapping = get_fragments_from_mol(ligand)
+        
+    current_seeds = []
+    complx = None
+    pocket = None
+    if len(fragments) > 1:
+        
+        if not all([7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()] 
+                    for fragment in fragments]):
+        
+            try:
+                pocket_full_path = os.path.join(CROSSDOCKED_POCKET10_PATH, pocket_path)
+                pocket = Chem.MolFromPDBFile(pocket_full_path, sanitize=False)
+                if pocket.GetNumAtoms() > 20 :
+                    complx = Complex(ligand, protein_path, pocket_full_path)
+                    # complx._pocket = Chem.MolFromPDBFile(pocket_full_path)
+                    # if all([atom.GetAtomicNum() in z_list for atom in complx.pocket.mol.GetAtoms()]):
+                    pf = complx.vina_protein.pdbqt_filepath
+            
+                    for fragment in fragments:
+                        if not any([7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()]]):
+                            current_seed = Fragment.from_fragment(fragment)
+                            current_seeds.append(current_seed)
+            except:
+                print(f'No pdbqt file for {protein_path}')
+                
+    return current_seeds, complx, pocket
 
 complexes: list[Complex] = []
 seeds: list[Fragment] = []
+seed2complex = []
 generation_sequences = []
-z = list(zip(protein_paths, ligands))
-# z = z[:500]
-for protein_path, ligand in tqdm(z, total=len(z)):
-    fragments, frags_mol_atom_mapping = get_fragments_from_mol(ligand)
-    
-    if len(fragments) > 1:
+protein_paths = []
+considered_ligands = []
+pocket_paths = []
+for duo, ligand in tqdm(zip(cd_split, cd_ligands), total=len(cd_split)):
+    if all([atom.GetAtomicNum() in z_list for atom in ligand.GetAtoms()]):
+        pocket_path, ligand_subpath = duo
+        protein_paths.append(cross_docked_train.get_original_structure_path(ligand_filename=ligand_subpath))
+        considered_ligands.append(ligand)
+        pocket_paths.append(pocket_path)
         
-        has_7 = [7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()] for fragment in fragments]
+training_data_path = '/home/bb596/hdd/ymir/training_data.pkl'
+# if not os.path.exists(training_data_path):
         
-        if not any(has_7):
+    # with Pool(20, maxtasksperchild=1) as p:
+    #     results = p.map(get_seeds_complx, 
+    #                     [(protein_path, ligand) for protein_path, ligand in zip(protein_paths, considered_ligands)])
+    #     for result in tqdm(results, total=len(protein_paths)):
+    #         seeds.extend(result[0])
+    #         seed2complex.extend([len(complexes) - 1] * len(result[0]))
+    #         generation_sequences.extend([None] * len(result[0]))
+    #         complexes.append(result[1])
+
         
-            fragment_in_actions = []
-            for fragment in fragments:
-                frag_copy = Fragment.from_fragment(fragment)
-                
-                # up_smiles = Chem.MolToSmiles(frag_copy.mol)
-                
-                s_smiles_list = []
-                authorized = []
-                for attach_point, label in frag_copy.get_attach_points().items():
-                    p_frag = Fragment.from_fragment(fragment)
-                    p_frag.unprotect()
-                    atom_ids_to_keep = [atom_id for atom_id in range(p_frag.mol.GetNumAtoms())]
-                    atom_ids_to_keep.remove(attach_point)
-                    p_frag.protect(atom_ids_to_keep=atom_ids_to_keep)
-                    s_smiles = Chem.MolToSmiles(p_frag.mol)
-                    in_dataset = False
-                    if s_smiles in synthon_smiles:
-                        smiles_idx = synthon_smiles.index(s_smiles)
-                        if label in attach_labels[smiles_idx]:
-                            in_dataset = True
-                    authorized.append(in_dataset)
-                
-                fragment_in_actions.append(all(authorized))
+for protein_path, pocket_path, ligand in tqdm(zip(protein_paths, pocket_paths, considered_ligands), 
+                                                total=len(protein_paths)):
+    current_seeds, complx, pocket = get_seeds_complx((protein_path, pocket_path, ligand))
+    if len(current_seeds) > 0:
+        complexes.append(complx)
+        seeds.extend(current_seeds)
+        seed2complex.extend([len(complexes) - 1 for _ in current_seeds])
+        generation_sequences.extend([None for _ in current_seeds])
+           
+    # training_data = {'seeds': seeds,
+    #                     'seed2complex': seed2complex,
+    #                     'generation_sequences': generation_sequences,
+    #                     'complexes': complexes}
             
-            # take ligands with fragments only in the protected fragments
-            if all(fragment_in_actions):
-                current_seeds, current_paths, current_complexes  = get_paths(ligand, 
-                                                                            fragments, 
-                                                                            protein_path, 
-                                                                            lp_pdbbind_subsets, 
-                                                                            glide_not_working,
-                                                                            frags_mol_atom_mapping,
-                                                                            synthon_smiles,
-                                                                            attach_labels)
-                seeds.extend(current_seeds)
-                complexes.extend(current_complexes)
-                generation_sequences.extend(current_paths)
-            # elif sum(fragment_in_actions) + 1 == len(fragment_in_actions):
-            #     import pdb;pdb.set_trace()
+    # with open(training_data_path, 'wb') as f:
+    #     pickle.dump(training_data, f)
+         
+# else:
+#     with open(training_data_path, 'rb') as f:
+#         training_data = pickle.load(f)
+#     seeds = training_data['seeds']
+#     seed2complex = training_data['seed2complex']
+#     generation_sequences = training_data['generation_sequences']
+#     complexes = training_data['complexes']
+    
+        # protein_path = cross_docked_train.get_original_structure_path(ligand_filename=ligand_subpath)
+        # fragments, frags_mol_atom_mapping = get_fragments_from_mol(ligand)
+        
+        # if len(fragments) > 1:
+            
+        #     if not all([7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()] for fragment in fragments]):
+            
+        #         try:
+        #             complx = Complex(ligand, protein_path)
+        #             # if all([atom.GetAtomicNum() in z_list for atom in complx.pocket.mol.GetAtoms()]):
+        #             pf = complx.vina_protein.pdbqt_filepath
+        #             pocket = complx.pocket
+        #             complexes.append(complx)
+            
+        #             for fragment in fragments:
+        #                 if not any([7 in [atom.GetIsotope() for atom in fragment.mol.GetAtoms()]]):
+        #                     current_seed = Fragment.from_fragment(fragment)
+        #                     seeds.append(current_seed)
+        #                     seed2complex.append(len(complexes) - 1)
+        #                     generation_sequences.append(None)
+        #             # else:
+        #             #     import pdb;pdb.set_trace()
+        #             #     print(f'No pocket for {ligand_subpath}')
+        #         except:
+        #             print(f'No pdbqt file for {ligand_subpath}')
                 
 n_complexes = len(complexes)
 
-initial_scores_path = f'/home/bb596/hdd/ymir/initial_scores_{n_complexes}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
-native_scores_path = f'/home/bb596/hdd/ymir/native_scores_{n_complexes}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
-if (not os.path.exists(initial_scores_path)) or (not os.path.exists(native_scores_path)):
+# for complx in complexes:
+# def get_vina_protein(i: int,
+#                      complx: Complex):
+#     try:
+#         pf = complx.vina_protein.pdbqt_filepath
+#     except Exception as e:
+#         print(type(e))
+#         print(str(e))
+# with Pool(12) as p:
+#     results = p.starmap_async(get_vina_protein, [(i, complx) for i, complx in enumerate(complexes)])
+#     for result in tqdm(results.get(), total=len(complexes)):
+#         pass
 
-    initial_scores = []
-    native_scores = []
-    # Non optimal
-    for seed, complx in tqdm(zip(seeds, complexes), total=n_complexes):
-        smina_cli = SminaCLI()
-        seed_copy = Fragment.from_fragment(seed)
+initial_scores_path = f'/home/bb596/hdd/ymir/initial_scores_{n_complexes}cplx_200frags_3rots_{SCORING_FUNCTION}_min_cd.pkl'
+if not os.path.exists(initial_scores_path):
+    receptor_paths = [complexes[seed2complex[seed_i]].vina_protein.pdbqt_filepath for seed_i in range(len(seeds))]
+    seed_copies = [Fragment.from_fragment(seed) for seed in seeds]
+    for seed_copy in seed_copies:
         seed_copy.protect()
-        mols = [seed_copy.mol]
-        scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath],
-                            ligands=mols)
-        assert len(scores) == 1
-        initial_scores.append(scores[0])
-        
-        smina_cli = SminaCLI(score_only=False)
-        scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath],
-                            ligands=[complx.ligand])
-        assert len(scores) == 1
-        native_scores.append(scores[0])
-        
+    mols = [seed_copy.mol for seed_copy in seed_copies]
+    smina_cli = SminaCLI()
+    initial_scores = smina_cli.get(receptor_paths=receptor_paths,
+                                ligands=mols)
+    assert len(initial_scores) == len(seeds)
+    
     with open(initial_scores_path, 'wb') as f:
         pickle.dump(initial_scores, f)
+        
+else:
+    with open(initial_scores_path, 'rb') as f:
+        initial_scores = pickle.load(f)
+
+native_scores_path = f'/home/bb596/hdd/ymir/native_scores_{n_complexes}cplx_200frags_3rots_{SCORING_FUNCTION}_min_cd.pkl'
+if not os.path.exists(native_scores_path):
+    receptor_paths = [complx.vina_protein.pdbqt_filepath for complx in complexes]
+    smina_cli = SminaCLI(score_only=False)
+    scores = smina_cli.get(receptor_paths=receptor_paths,
+                        ligands=[complx.ligand for complx in complexes])
+    assert len(scores) == len(complexes)
+    native_scores = [scores[i] for i in seed2complex]
+    assert len(native_scores) == len(seeds)
         
     with open(native_scores_path, 'wb') as f:
         pickle.dump(native_scores, f)
     
-else:
-    with open(initial_scores_path, 'rb') as f:
-        initial_scores = pickle.load(f)
-        
+else: 
     with open(native_scores_path, 'rb') as f:
         native_scores = pickle.load(f)
 
-
-assert len(initial_scores) == n_complexes
-assert len(native_scores) == n_complexes
-
 # remove complexes with positive initial Glide scores
 original_valid_idxs = [i for i, score in enumerate(initial_scores) if score < 0]
-valid_idxs = original_valid_idxs[:560]
+n_valid = len(original_valid_idxs)
+valid_idxs = original_valid_idxs[:n_valid // n_envs * n_envs]
 
 seeds = [seeds[i] for i in valid_idxs]
-complexes = [complexes[i] for i in valid_idxs]
+seed2complex = [seed2complex[i] for i in valid_idxs]
 generation_sequences = [generation_sequences[i] for i in valid_idxs]
 initial_scores = [initial_scores[i] for i in valid_idxs]
 native_scores = [native_scores[i] for i in valid_idxs]
 
 valid_action_masks = get_masks(attach_labels)
 
-n_complexes = len(complexes)
-logging.info(f'Training on {n_complexes} complexes')
+n_complexes = len(set(seed2complex))
+n_seeds = len(seeds)
+logging.info(f'Training on {n_complexes} complexes for {n_seeds} seeds')
 
 logging.info(f'There are {len(rotated_fragments)} fragments with {len(rotated_fragments[0])} torsions each')
+
+
 
 envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(rotated_fragments=rotated_fragments,
                                                      attach_labels=attach_labels,
@@ -274,7 +346,6 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(rotated_fragments=rotated_f
                                                     pocket_feature_type=pocket_feature_type,)
                                   for _ in range(n_envs)]
 
-n_torsions = len(TORSION_ANGLES_DEG)
 # memory_path = f'/home/bb596/hdd/ymir/memory_{len(original_valid_idxs)}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
 # if os.path.exists(memory_path):
 #     with open(memory_path, 'rb') as f:
@@ -302,7 +373,7 @@ agent = Agent(protected_fragments=protected_fragments,
               features_dim=batch_env.pocket_feature_dim,
               pocket_feature_type=pocket_feature_type,
               )
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_v1_11_04_2024_20_12_31_6000.pt')
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_02_07_2024_16_24_49_step_40000_ent_1.0.pt')
 # agent.load_state_dict(state_dict)
 
 agent = agent.to(device)
@@ -323,9 +394,10 @@ try:
         
         logging.debug(f'Episode i: {episode_i}')
         
-        # seed_i = episode_i % n_complexes
-        # seed_idxs = [seed_i] * n_envs
-        seed_idxs = [idx % n_complexes for idx in range(episode_i * n_envs, (episode_i + 1) * n_envs)]
+        seed_i = (episode_i + 0) % n_seeds # + 40000 from the save
+        seed_idxs = [seed_i] * n_envs
+        # seed_idxs = [idx % len(seeds) 
+        #              for idx in range(episode_i * n_envs, (episode_i + 1) * n_envs)]
             
         if (0 in seed_idxs) and n_real_data > 0:
             n_real_data -= 1
@@ -359,6 +431,7 @@ try:
                             episode_i,
                             seed_idxs, 
                             seeds,
+                            seed2complex,
                             complexes,
                             initial_scores,
                             native_scores,
@@ -375,8 +448,8 @@ try:
                             pocket_feature_type)
             
         current_scores.extend(scores)
-        assert len(current_scores) <= len(complexes)
-        if len(current_scores) == len(complexes):
+        assert len(current_scores) <= len(seeds)
+        if len(current_scores) == len(seeds):
             mean_score = np.mean(current_scores)
         
             if mean_score < best_mean_score:

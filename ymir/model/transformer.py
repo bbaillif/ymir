@@ -17,12 +17,12 @@ IRREPS_ATTENTION = o3.Irreps('0e')
 MOL_ID_EMBEDDING_SIZE = 16
 NODE_Z_EMBEDDING_SIZE = 64 - MOL_ID_EMBEDDING_SIZE
 MIDDLE_LAYER_SIZE = 32
-MAX_NUMBER_TYPES = 100
 
 class Transformer(torch.nn.Module):
     
     def __init__(self, 
                  irreps_output: o3.Irreps,
+                 num_elements: int,
                  node_z_embedding_size: int = NODE_Z_EMBEDDING_SIZE,
                  node_mol_embedding_size: int = MOL_ID_EMBEDDING_SIZE,
                  irreps_query: o3.Irreps = IRREPS_QUERY,
@@ -35,9 +35,10 @@ class Transformer(torch.nn.Module):
                  *args, 
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.irreps_output = irreps_output
+        self.num_elements = num_elements
         self.node_z_embedding_size = node_z_embedding_size
         self.node_mol_embedding_size = node_mol_embedding_size
-        self.irreps_output = irreps_output
         self.irreps_query = irreps_query
         self.irreps_key = irreps_key
         self.irreps_attention = irreps_attention
@@ -46,7 +47,7 @@ class Transformer(torch.nn.Module):
         self.number_of_basis = number_of_basis
         self.middle_layer_size = middle_layer_size
         
-        self.node_z_embedder = torch.nn.Embedding(num_embeddings=MAX_NUMBER_TYPES, 
+        self.node_z_embedder = torch.nn.Embedding(num_embeddings=self.num_elements, 
                                                   embedding_dim=self.node_z_embedding_size)
         self.node_mol_embedder = torch.nn.Embedding(num_embeddings=2, # seed or pocket
                                                     embedding_dim=self.node_mol_embedding_size)

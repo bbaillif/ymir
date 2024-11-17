@@ -1,3 +1,4 @@
+from rdkit import Chem
 from rdkit.Chem import BRICS
 from scipy.spatial import distance_matrix
 from collections import defaultdict
@@ -103,10 +104,13 @@ reactions = BRICS.reverseReactions
                     
 #                     # yield product, complete_seed_atom_ids
 #                     yield product, seed_atom_ids
-                    
-                    
-def add_fragment_to_seed(seed: Fragment,
-                         fragment: Fragment):
+             
+             
+def check_assembly(seed: Fragment,
+                   fragment: Fragment):
+    
+    seed_mol = seed.mol
+    frag_mol = fragment.mol
     
     seed_attach_points = seed.get_attach_points()
     assert len(seed_attach_points) == 1, 'There must be only one attach point on seed'
@@ -118,21 +122,37 @@ def add_fragment_to_seed(seed: Fragment,
     fragment_attach_label: int = list(fragment_attach_points.values())[0]
     potential_reactions_seed = potential_reactions[seed_attach_label]
     
-    try:
-        assert fragment_attach_label in potential_reactions_seed
-    except:
-        import pdb;pdb.set_trace()
+    return fragment_attach_label in potential_reactions_seed
+                    
+                    
+def add_fragment_to_seed(seed: Fragment,
+                         fragment: Fragment) -> tuple[Fragment, list[int], list[int]]:
+    
+    seed_mol = seed.mol
+    frag_mol = fragment.mol
+    
+    seed_attach_points = seed.get_attach_points()
+    assert len(seed_attach_points) == 1, 'There must be only one attach point on seed'
+    
+    fragment_attach_points = fragment.get_attach_points()
+    assert len(fragment_attach_points) == 1, 'There must be only one attach point on fragment'
+    
+    seed_attach_label: int = list(seed_attach_points.values())[0]
+    fragment_attach_label: int = list(fragment_attach_points.values())[0]
+    potential_reactions_seed = potential_reactions[seed_attach_label]
+    
+    assert fragment_attach_label in potential_reactions_seed, 'Fragment attach label must be in potential reactions for seed'
     
     rxn_i, bond_type = potential_reactions_seed[fragment_attach_label]
     rxn = reactions[rxn_i]
     
     reactions_products = []
-    if fragment.HasSubstructMatch(rxn._matchers[0]):
-        if seed.HasSubstructMatch(rxn._matchers[1]):
-            reactions_products = rxn.RunReactants((fragment, seed))
-    elif fragment.HasSubstructMatch(rxn._matchers[1]):
-        if seed.HasSubstructMatch(rxn._matchers[0]):
-            reactions_products = rxn.RunReactants((seed, fragment))
+    if frag_mol.HasSubstructMatch(rxn._matchers[0]):
+        if seed_mol.HasSubstructMatch(rxn._matchers[1]):
+            reactions_products = rxn.RunReactants((frag_mol, seed_mol))
+    elif frag_mol.HasSubstructMatch(rxn._matchers[1]):
+        if seed_mol.HasSubstructMatch(rxn._matchers[0]):
+            reactions_products = rxn.RunReactants((seed_mol, frag_mol))
     
     try:
         assert len(reactions_products) == 1
@@ -144,19 +164,19 @@ def add_fragment_to_seed(seed: Fragment,
     product = products[0]
     
     product_positions = product.GetConformer().GetPositions()
-    seed_positions = seed.GetConformer().GetPositions()
+    seed_positions = seed_mol.GetConformer().GetPositions()
     
     dists = distance_matrix(seed_positions, product_positions)
-    closest_product_id_in_seed = dists.argmin(axis=1)
-    seed_to_product_mapping = {seed_id: int(product_id) 
-                                for seed_id, product_id in enumerate(closest_product_id_in_seed)}
+    seed_to_product_mapping = dists.argmin(axis=1).tolist()
+    # seed_to_product_mapping = {seed_id: int(product_id) 
+    #                             for seed_id, product_id in enumerate(closest_product_id_in_seed)}
 
-    fragment_positions = fragment.GetConformer().GetPositions()
+    fragment_positions = frag_mol.GetConformer().GetPositions()
     
     dists = distance_matrix(fragment_positions, product_positions)
-    closest_product_id_in_frag = dists.argmin(axis=1)
-    fragment_to_product_mapping = {frag_id: int(product_id) 
-                                    for frag_id, product_id in enumerate(closest_product_id_in_frag)}
+    fragment_to_product_mapping = dists.argmin(axis=1).tolist()
+    # fragment_to_product_mapping = {frag_id: int(product_id) 
+    #                                 for frag_id, product_id in enumerate(closest_product_id_in_frag)}
         
     seed_protections = seed.protections
     fragment_protections = fragment.protections
@@ -164,28 +184,33 @@ def add_fragment_to_seed(seed: Fragment,
                                                   seed_to_product_mapping,
                                                   fragment_protections,
                                                   fragment_to_product_mapping)
-    product = Fragment(mol=product, protections=product_protections)
-    product.unprotect()
+    try:
+        product = Fragment(mol=product, protections=product_protections)
+        product.unprotect()
+    except:
+        import pdb;pdb.set_trace()
     
-    return product
+    Chem.SanitizeMol(product.mol)
+    
+    return product, seed_to_product_mapping, fragment_to_product_mapping
     
     
-def get_product_protections(seed_protections,
-                            seed_to_product_mapping,
-                            fragment_protections,
-                            fragment_to_product_mapping):
+def get_product_protections(seed_protections: dict[int, int],
+                            seed_to_product_mapping: list[int],
+                            fragment_protections: dict[int, int],
+                            fragment_to_product_mapping: list[int]):
     
     # deprotect product
     product_protections = {}
-    for seed_id, attach_point in seed_protections.items():
+    for seed_id, label in seed_protections.items():
         product_id = seed_to_product_mapping[seed_id]
-        product_protections[product_id] = attach_point
-    for frag_id, attach_point in fragment_protections.items():
+        product_protections[product_id] = label
+    for frag_id, label in fragment_protections.items():
         try:
             product_id = fragment_to_product_mapping[frag_id]
         except Exception as e:
             print(e)
             import pdb;pdb.set_trace()
-        product_protections[product_id] = attach_point
+        product_protections[product_id] = label
         
     return product_protections

@@ -37,7 +37,7 @@ from ymir.metrics.activity.glide_score import GlideScore
 from ymir.metrics.activity.smina_cli import SminaCLI
 
 
-logging.basicConfig(filename='train.log', 
+logging.basicConfig(filename='train_reinforce.log', 
                     encoding='utf-8', 
                     level=logging.INFO,
                     format='%(asctime)s %(levelname)s:%(message)s', 
@@ -54,19 +54,17 @@ torch.backends.cudnn.deterministic = True
 # 1 episode = grow fragments + update NN
 n_episodes = 1_000_000
 # n_envs = 256 # we will have protein envs in parallel
-n_envs = 140
+n_envs = 8
 batch_size = n_envs
 n_max_steps = 5 # number of maximum fragment growing
 # lr = 5e-4
 # lr = 1e-4
-lr = 5e-6
+lr = 1e-6
 gamma = 0.95 # discount factor for rewards
 device = torch.device('cuda')
-ent_coef = 2.0
+ent_coef = 1.0
 # ent_coef = 0.2
-# ent_patience = 10
-ent_patience = 100
-ent_coef_step = ent_coef / 20
+ent_coef_step = ent_coef / 10
 gae_lambda = 0.95
 clip_coef = 0.5
 n_epochs = 5
@@ -98,7 +96,7 @@ ligands = fragment_library.get_restricted_ligands(z_list)
 if SCORING_FUNCTION == 'glide':
     ligands = [Chem.AddHs(ligand, addCoords=True) for ligand in ligands]
 
-n_fragments = 200
+n_fragments = 100
 # Remove fragment having at least one heavy atom not in list
 restricted_fragments = fragment_library.get_restricted_fragments(z_list, 
                                                                 max_attach=4, 
@@ -123,17 +121,39 @@ if SCORING_FUNCTION == 'smina':
         # pfrag.mol.Debug()
         pfrag.remove_hs()
     
+# for fragment in protected_fragments:
+#     Chem.SanitizeMol(fragment.mol)
+    
 center_fragments(protected_fragments)
     
 with Chem.SDWriter('protected_fragments.sdf') as sdwriter:
     for f in protected_fragments:
         sdwriter.write(f.mol)
+# import pdb;pdb.set_trace()
     
 torsion_angles_deg = TORSION_ANGLES_DEG
 n_torsions = len(torsion_angles_deg)
 rotated_fragments = get_rotated_fragments(protected_fragments, torsion_angles_deg)
+    
+protected_fragments_smiles = [Chem.MolToSmiles(frag.mol) for frag in protected_fragments]
 
-if len(set(synthon_smiles)) != len(synthon_smiles):
+unprotected_fragments = []
+for fragment in protected_fragments:
+    frag_copy = Fragment.from_fragment(fragment)
+    try:
+        frag_copy.unprotect()
+    except:
+        import pdb;pdb.set_trace()
+    unprotected_fragments.append(frag_copy)
+
+unprotected_fragments_smiles = [Chem.MolToSmiles(frag.mol) for frag in unprotected_fragments]
+
+# import pdb;pdb.set_trace()
+
+smiles_combos = [(p_smiles, up_smiles) 
+                 for p_smiles, up_smiles in zip(protected_fragments_smiles, unprotected_fragments_smiles)]
+
+if len(set(smiles_combos)) != len(smiles_combos):
     import pdb;pdb.set_trace()
 
 pocket_radius = POCKET_RADIUS
@@ -169,26 +189,23 @@ for protein_path, ligand in tqdm(z, total=len(z)):
             fragment_in_actions = []
             for fragment in fragments:
                 frag_copy = Fragment.from_fragment(fragment)
+                up_smiles = Chem.MolToSmiles(frag_copy.mol)
                 
-                # up_smiles = Chem.MolToSmiles(frag_copy.mol)
-                
-                s_smiles_list = []
-                authorized = []
+                p_smiles_list = []
                 for attach_point, label in frag_copy.get_attach_points().items():
                     p_frag = Fragment.from_fragment(fragment)
-                    p_frag.unprotect()
-                    atom_ids_to_keep = [atom_id for atom_id in range(p_frag.mol.GetNumAtoms())]
-                    atom_ids_to_keep.remove(attach_point)
-                    p_frag.protect(atom_ids_to_keep=atom_ids_to_keep)
-                    s_smiles = Chem.MolToSmiles(p_frag.mol)
-                    in_dataset = False
-                    if s_smiles in synthon_smiles:
-                        smiles_idx = synthon_smiles.index(s_smiles)
-                        if label in attach_labels[smiles_idx]:
-                            in_dataset = True
-                    authorized.append(in_dataset)
+                    p_frag.protect(atom_ids_to_keep=[attach_point])
+                    p_smiles = Chem.MolToSmiles(p_frag.mol)
+                    p_smiles_list.append(p_smiles)
                 
-                fragment_in_actions.append(all(authorized))
+                up_smiles_ok = up_smiles in unprotected_fragments_smiles
+                p_smiles_ok = all([p_smiles in protected_fragments_smiles for p_smiles in p_smiles_list])
+                
+                if up_smiles_ok and not p_smiles_ok:
+                    import pdb;pdb.set_trace()
+                # import pdb;pdb.set_trace()
+                # combo = (p_smiles, up_smiles)
+                fragment_in_actions.append(up_smiles_ok and p_smiles_ok)
             
             # take ligands with fragments only in the protected fragments
             if all(fragment_in_actions):
@@ -198,8 +215,7 @@ for protein_path, ligand in tqdm(z, total=len(z)):
                                                                             lp_pdbbind_subsets, 
                                                                             glide_not_working,
                                                                             frags_mol_atom_mapping,
-                                                                            synthon_smiles,
-                                                                            attach_labels)
+                                                                            smiles_combos)
                 seeds.extend(current_seeds)
                 complexes.extend(current_complexes)
                 generation_sequences.extend(current_paths)
@@ -208,9 +224,26 @@ for protein_path, ligand in tqdm(z, total=len(z)):
                 
 n_complexes = len(complexes)
 
+# receptor_paths = [complx.vina_protein.pdbqt_filepath 
+#                     for complx in complexes]
+
+# initial_scores = [0 for _ in receptor_paths]
+
 initial_scores_path = f'/home/bb596/hdd/ymir/initial_scores_{n_complexes}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
 native_scores_path = f'/home/bb596/hdd/ymir/native_scores_{n_complexes}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
 if (not os.path.exists(initial_scores_path)) or (not os.path.exists(native_scores_path)):
+
+#     initial_scores = []
+#     for seed, complx in tqdm(zip(seeds, complexes), total=n_complexes):
+#         glide_protein = GlideProtein(pdb_filepath=complx.vina_protein.protein_clean_filepath,
+#                                         native_ligand=complx.ligand)
+#         glide = GlideScore(glide_protein, mininplace=False)
+#         seed_copy = Fragment.from_fragment(seed)
+#         seed_copy.protect()
+#         mols = [seed_copy.mol]
+#         scores = glide.get(mols=mols)
+#         assert len(scores) == 1
+#         initial_scores.append(scores[0])
 
     initial_scores = []
     native_scores = []
@@ -225,7 +258,7 @@ if (not os.path.exists(initial_scores_path)) or (not os.path.exists(native_score
         assert len(scores) == 1
         initial_scores.append(scores[0])
         
-        smina_cli = SminaCLI(score_only=False)
+        smina_cli = SminaCLI()
         scores = smina_cli.get(receptor_paths=[complx.vina_protein.pdbqt_filepath],
                             ligands=[complx.ligand])
         assert len(scores) == 1
@@ -250,15 +283,14 @@ assert len(native_scores) == n_complexes
 
 # remove complexes with positive initial Glide scores
 original_valid_idxs = [i for i, score in enumerate(initial_scores) if score < 0]
-valid_idxs = original_valid_idxs[:560]
+valid_idxs = original_valid_idxs
 
 seeds = [seeds[i] for i in valid_idxs]
 complexes = [complexes[i] for i in valid_idxs]
 generation_sequences = [generation_sequences[i] for i in valid_idxs]
 initial_scores = [initial_scores[i] for i in valid_idxs]
-native_scores = [native_scores[i] for i in valid_idxs]
 
-valid_action_masks = get_masks(attach_labels)
+valid_action_masks = get_masks(protected_fragments)
 
 n_complexes = len(complexes)
 logging.info(f'Training on {n_complexes} complexes')
@@ -266,7 +298,6 @@ logging.info(f'Training on {n_complexes} complexes')
 logging.info(f'There are {len(rotated_fragments)} fragments with {len(rotated_fragments[0])} torsions each')
 
 envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(rotated_fragments=rotated_fragments,
-                                                     attach_labels=attach_labels,
                                                      z_table=z_table,
                                                     max_episode_steps=n_max_steps,
                                                     valid_action_masks=valid_action_masks,
@@ -275,24 +306,20 @@ envs: list[FragmentBuilderEnv] = [FragmentBuilderEnv(rotated_fragments=rotated_f
                                   for _ in range(n_envs)]
 
 n_torsions = len(TORSION_ANGLES_DEG)
-# memory_path = f'/home/bb596/hdd/ymir/memory_{len(original_valid_idxs)}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
-# if os.path.exists(memory_path):
-#     with open(memory_path, 'rb') as f:
-#         memory = pickle.load(f)
-# else:
-#     memory = {}
-memory = {}
+memory_path = f'/home/bb596/hdd/ymir/memory_{len(original_valid_idxs)}cplx_{n_fragments}frags_{n_torsions}rots_{SCORING_FUNCTION}_min.pkl'
+if os.path.exists(memory_path):
+    with open(memory_path, 'rb') as f:
+        memory = pickle.load(f)
+else:
+    memory = {}
     
 memory_size = len(memory)
 
 memory_save_step = 500
 memory_i = memory_size // memory_save_step
 
-best_scores = {i: score for i, score in enumerate(initial_scores)}
-
 batch_env = BatchEnv(envs,
                      memory,
-                     best_scores,
                      pocket_feature_type=pocket_feature_type,
                      scoring_function=SCORING_FUNCTION,
                      )
@@ -312,10 +339,6 @@ optimizer = Adam(agent.parameters(), lr=lr)
 # n_real_data = n_envs // 2 + 1
 # n_real_data = 8
 n_real_data = 0
-
-best_mean_score = 0
-iteration_since_best = 0
-current_scores = []
 
 try:
 
@@ -355,7 +378,7 @@ try:
                     use_entropy_loss)
             
         else:
-            scores = reinforce_episode(agent,
+            reinforce_episode(agent,
                             episode_i,
                             seed_idxs, 
                             seeds,
@@ -373,24 +396,6 @@ try:
                             ent_coef,
                             use_entropy_loss,
                             pocket_feature_type)
-            
-        current_scores.extend(scores)
-        assert len(current_scores) <= len(complexes)
-        if len(current_scores) == len(complexes):
-            mean_score = np.mean(current_scores)
-        
-            if mean_score < best_mean_score:
-                best_mean_score = mean_score
-                logging.info(f'New best mean score: {best_mean_score}, after {iteration_since_best} steps')
-                iteration_since_best = 0
-            else:
-                iteration_since_best += 1
-                if iteration_since_best > ent_patience:
-                    logging.info(f'Decreasing entropy coefficient from {ent_coef} to {max(0.00, ent_coef - ent_coef_step)} after {iteration_since_best} steps without improvement')
-                    ent_coef = max(0.00, ent_coef - ent_coef_step)
-                    iteration_since_best = 0
-            
-            current_scores = []
         
         # Save memory every memory_save_step
         # memory_size = len(memory)
@@ -401,15 +406,15 @@ try:
         #     memory_i = current_memory_i
         # logging.info(f'Memory size: {memory_size}')
         
-        if ((episode_i + 1) % 5000 == 0):
+        if ((episode_i + 1) % 2000 == 0):
             if use_entropy_loss:
                 save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_step_{(episode_i + 1)}_ent_{ent_coef}.pt'
-                # ent_coef = max(0.00, ent_coef - ent_coef_step)
+                ent_coef = max(0.00, ent_coef - ent_coef_step)
             else:
                 save_path = f'/home/bb596/hdd/ymir/models/{experiment_name}_step_{(episode_i + 1)}.pt'
             torch.save(agent.state_dict(), save_path)
-            # with open(memory_path, 'wb') as f:
-            #     pickle.dump(memory, f)
+            with open(memory_path, 'wb') as f:
+                pickle.dump(memory, f)
             
             
         # import pdb;pdb.set_trace()
@@ -423,8 +428,8 @@ except KeyboardInterrupt:
 #     import pdb;pdb.set_trace()
 #     print(exc)
         
-# with open(memory_path, 'wb') as f:
-#     pickle.dump(memory, f)
+with open(memory_path, 'wb') as f:
+    pickle.dump(memory, f)
 # memory_i = current_memory_i
         
 # except Exception as e:

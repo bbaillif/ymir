@@ -16,7 +16,7 @@ class AtomisticNN(ABC):
                  readout: str = 'sum',
                  features_dim: int = FEATURES_DIM) -> None:
         self.readout = readout
-        self.feature_dim = features_dim
+        self.features_dim = features_dim
         
     
     @abstractmethod

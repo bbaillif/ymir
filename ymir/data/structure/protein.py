@@ -15,7 +15,9 @@ class Protein():
     
     @property
     def universe(self):
-        if self._universe is None:
-            self._universe = Universe(self.pdb_filepath)
-        return self._universe
+        universe = Universe(self.pdb_filepath)
+        return universe
+        # if self._universe is None:
+        #     self._universe = Universe(self.pdb_filepath)
+        # return self._universe
         

@@ -29,7 +29,9 @@ class CategoricalMasked(Categorical):
     def entropy(self):
         if self.masks is None:
             return super().entropy()
-        p_log_p = self.logits * self.probs
+        min_real = torch.finfo(self.logits.dtype).min
+        logits = torch.clamp(self.logits, min=min_real)
+        p_log_p = logits * self.probs
         zero_value = torch.tensor(0, dtype=p_log_p.dtype, 
                                            device=p_log_p.device)
         p_log_p = torch.where(self.masks, 

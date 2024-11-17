@@ -7,7 +7,7 @@ from e3nn.math import (soft_one_hot_linspace,
 from e3nn import o3
 from e3nn.nn import FullyConnectedNet
 from torch_geometric.data import Batch
-from ymir.params import MAX_RADIUS
+from ymir.params import CNN_RADIUS
 
 L_MAX = 3
 NUMBER_OF_BASIS = 10
@@ -23,7 +23,7 @@ class TransformerSN(torch.nn.Module):
                  node_z_embedding_size: int = NODE_Z_EMBEDDING_SIZE,
                  node_mol_embedding_size: int = MOL_ID_EMBEDDING_SIZE,
                  lmax: int = L_MAX,
-                 max_radius: float = MAX_RADIUS,
+                 max_radius: float = CNN_RADIUS,
                  number_of_basis: int = NUMBER_OF_BASIS,
                  middle_layer_size: int = MIDDLE_LAYER_SIZE,
                  *args, 

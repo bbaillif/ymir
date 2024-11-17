@@ -698,7 +698,7 @@ class PDBbind() :
             protein_path, ligand_pathes = self.get_pdb_id_pathes(pdb_id=pdb_id,
                                                                     ligand_format='sdf')
             ligand_path = ligand_pathes[0]
-            mol = [m for m in Chem.SDMolSupplier(ligand_path)][0]
+            mol = [m for m in Chem.SDMolSupplier(ligand_path, removeHs=False)][0]
             if mol is None :
                 raise FailedSDFParsingException(pdb_id)
             else:

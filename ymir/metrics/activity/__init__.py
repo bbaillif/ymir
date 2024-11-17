@@ -4,3 +4,4 @@ from .glide_score import GlideScore
 # from .ifp_similarity import IFPSimilarity
 # from .espsim import ESPSIM
 # from .gold_plp_score import GoldPLPScore
+from .smina_cli import SminaCLI

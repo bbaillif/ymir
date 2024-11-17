@@ -4,6 +4,7 @@ from typing import Dict, Any
 from .atomistic.comenet import AtomicComENet
 from .atomistic_nn_model import AtomisticNNModel
 from ymir.params import COMENET_MODEL_NAME, FEATURES_DIM
+from torch import nn
 
 class ComENetModel(AtomisticNNModel):
     """
@@ -22,6 +23,7 @@ class ComENetModel(AtomisticNNModel):
                  readout: str = 'add',
                  features_dim: int = FEATURES_DIM,
                  device: torch.device = torch.device('cuda')):
+        self.features_dim = features_dim
         atomistic_nn = AtomicComENet(readout=readout,
                                       features_dim=features_dim)
         AtomisticNNModel.__init__(self,
