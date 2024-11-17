@@ -394,7 +394,6 @@ class FragmentBuilderEnv():
                                                                     center_pos=center_pos,
                                                                     dummy_points=dummy_points)
             
-            print(len(dummy_x))
             
             pocket_x = dummy_x + protein_x + ligand_x
             pocket_pos = dummy_pos + protein_pos + ligand_pos
@@ -1099,8 +1098,9 @@ class BatchEnv():
             if np.isnan(state_save.score):
                 reward = 0
             else:
+                old_nha = env.seed.mol.GetNumHeavyAtoms()
                 seed_nha = state_save.seed.mol.GetNumHeavyAtoms()
-                size_malus = max(0, seed_nha - 40)
+                size_malus = max(0, seed_nha - 50) - max(0, old_nha - 50)
                 
                 # if seed_nha > 50:
                 #     size_malus = seed_nha - 50
@@ -1277,7 +1277,10 @@ class BatchEnv():
             # mol_h = env.get_clean_fragment(env.seed)
             # ligand_writer.write(mol_h)
             
-            ligand_writer.write(env.seed.mol)
+            seed_copy = Fragment.from_fragment(env.seed)
+            seed_copy.unprotect()
+            
+            ligand_writer.write(seed_copy.mol)
             
             clean_pocket = env.get_clean_pocket()
             pocket_writer.write(clean_pocket)

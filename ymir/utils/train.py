@@ -727,6 +727,9 @@ def ppo_episode(agent: Agent,
   
     writer.add_scalar(f"train/mean_reward", returns[0].mean().item(), episode_i)
     
+    # if episode_i == 50:
+    #     import pdb;pdb.set_trace()
+    
 def training_loop(agent: Agent,
                   b_obs: list[Data],
                     b_frag_actions,

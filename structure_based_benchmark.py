@@ -81,10 +81,10 @@ ligand_filenames_subset = [ligand_filename.strip() for ligand_filename in lines]
 #                            ]
 
 models: list[SBModel] = [
-                        # Ymir(minimized_path=config['data']['minimized_path'],
-                        #      gen_path='/home/bb596/hdd/ymir/generated_mols_cd_ppo_complex/',
-                        #      name='YmirComplex'),
-                        YmirRandom(minimized_path=config['data']['minimized_path'])
+                        Ymir(minimized_path=config['data']['minimized_path'],
+                             gen_path='/home/bb596/hdd/ymir/generated_mols_ymir_vrds/',
+                             name='YmirVRDS'),
+                        # YmirRandom(minimized_path=config['data']['minimized_path'])
                         ]
 
 d_results = {} # {target_name: {model_name: {rawOrProcessed: {metric: values_list}}}}

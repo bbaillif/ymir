@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import os
 import pickle
+import time
 
 from tqdm import tqdm
 from rdkit import Chem
@@ -224,17 +225,24 @@ agent = Agent(protected_fragments=protected_fragments,
               pocket_feature_type=pocket_feature_type,
               )
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_17_07_2024_23_39_59_step_10000_ent_0.1.pt') # single
-# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_19_07_2024_22_20_26_step_5000_ent_0.1.pt') # multi
+state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_19_07_2024_22_20_26_step_5000_ent_0.1.pt') # multi
 # state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_23_07_2024_20_17_26_step_4000_ent_0.1.pt') # le
-state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_25_07_2024_18_27_05_step_5000_ent_0.1.pt') # complex
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_25_07_2024_18_27_05_step_5000_ent_0.1.pt') # complexV0.1
+# state_dict = torch.load('/home/bb596/hdd/ymir/models/ymir_graph_12_08_2024_15_26_30_step_5000_ent_0.1.pt')
 
 agent.load_state_dict(state_dict)
 agent = agent.to(device)
 
+# model_prefix = 'ymir_vrds'
+model_suffix = 'ymir_vr'
+
 # gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd_ppo_multi/'
-gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd_ppo_complex/'
+# gen_mols_dir = '/home/bb596/hdd/ymir/generated_mols_cd_ppo_complex/'
+gen_mols_dir = f'/home/bb596/hdd/ymir/generated_mols_{model_suffix}/'
 if not os.path.exists(gen_mols_dir):
     os.mkdir(gen_mols_dir)
+    
+gen_times = []
     
 for complx_i, complx in enumerate(tqdm(complexes)):
     ligand_filename = selected_ligand_filenames[complx_i]
@@ -245,6 +253,8 @@ for complx_i, complx in enumerate(tqdm(complexes)):
     real_data_idxs = []
                 
     generated_ligands = []
+    
+    start_time = time.time()
     
     for _ in range(n_gen_molecules // batch_size):
         seed_idxs = [seed_i
@@ -302,6 +312,8 @@ for complx_i, complx in enumerate(tqdm(complexes)):
             
         generated_ligands.extend([env.seed.mol for env in batch_env.envs])
         
+    gen_times.append(time.time() - start_time)
+        
     # Save generated ligands
     save_dir = os.path.join(gen_mols_dir, target_dirname)
     if not os.path.exists(save_dir):
@@ -311,3 +323,7 @@ for complx_i, complx in enumerate(tqdm(complexes)):
         for mol in generated_ligands:
             writer.write(mol)
     
+print(f'Average generation time: {np.mean(gen_times)}')
+with open(f'/home/bb596/hdd/ymir/gen_times_{model_suffix}.txt', 'w') as f:
+    for gen_time in gen_times:
+        f.write(f'{gen_time}\n')
